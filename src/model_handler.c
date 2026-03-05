@@ -193,12 +193,26 @@ static const struct bt_mesh_model_op sensor_cli_ops[] = {
 // Post-provisioning Auto-Configuration
 // ============================================================================
 
-#define CONFIG_WQ_STACK_SIZE 4096
+#define CONFIG_WQ_STACK_SIZE 4096               // stack size for the configuration work queue thread
+#define CONFIG_RETRY_BASE_MS 500                // base retry delay in milliseconds for configuration steps (will be doubled on each retry)
+#define CONFIG_RETRY_MAX_SHIFT 4                // max backoff of 8 seconds (500ms * 2^4)
 static K_THREAD_STACK_DEFINE(config_wq_stack, CONFIG_WQ_STACK_SIZE);
-static struct k_work_q config_wq;
-static struct k_work_delayable configure_work;
+static struct k_work_q config_wq;               // create a work queue for configuration tasks
+static struct k_work_delayable configure_work;  // create a delayed work item for configuration
+static int configure_retry_count = 0;           // track the number of configuration retries
 
 #define SENSOR_CLI_MODEL_ID 0x1102
+
+static void schedule_retry(void)
+{
+    int shift = MIN(configure_retry_count, CONFIG_RETRY_MAX_SHIFT);
+    uint32_t delay_ms = CONFIG_RETRY_BASE_MS << shift;
+
+    LOG_INF("Scheduling configuration retry #%d in %u ms", configure_retry_count + 1, delay_ms);
+    configure_retry_count++;
+    k_work_schedule_for_queue(&config_wq, &configure_work, K_MSEC(delay_ms));
+
+}
 
 static void configure_handler(struct k_work *work)
 {
@@ -211,7 +225,7 @@ static void configure_handler(struct k_work *work)
     err = bt_mesh_app_key_add(APP_IDX, NET_IDX, app_key);
     if (err && err != -EALREADY) {
         LOG_ERR("Failed to add AppKey (err %d), retrying...", err);
-        k_work_schedule_for_queue(&config_wq, &configure_work, K_SECONDS(2));
+        schedule_retry();
         return;
     }
 
@@ -221,7 +235,7 @@ static void configure_handler(struct k_work *work)
                                        SENSOR_CLI_MODEL_ID, &status);
     if (err) {
         LOG_ERR("Failed to bind AppKey (err %d), retrying...", err);
-        k_work_schedule_for_queue(&config_wq, &configure_work, K_SECONDS(2));
+        schedule_retry();
         return;
     }
 
@@ -231,7 +245,7 @@ static void configure_handler(struct k_work *work)
                                       SENSOR_CLI_MODEL_ID, &status);
     if (err) {
         LOG_ERR("Failed to subscribe (err %d), retrying...", err);
-        k_work_schedule_for_queue(&config_wq, &configure_work, K_SECONDS(2));
+        schedule_retry();
         return;
     }
 
@@ -242,6 +256,14 @@ static void configure_handler(struct k_work *work)
         settings_save();
         LOG_INF("Settings saved");
     }
+    return;
+}
+
+static void prov_complete(uint16_t net_idx, uint16_t addr)
+{
+    LOG_INF("Provisioning complete: net_idx=0x%03X, addr=0x%04X", net_idx, addr);
+    configure_retry_count = 0; // reset retry count on successful provisioning
+    k_work_schedule_for_queue(&config_wq, &configure_work, K_NO_WAIT);
 }
 
 // ============================================================================
@@ -259,16 +281,11 @@ static void self_provision(void)
         memset(dev_uuid, 0xFF, sizeof(dev_uuid));
     }
 
-    /* Already provisioned — just schedule configuration */
+    /* Already provisioned — re-apply configuration (settings may not restore bindings) */
     if (bt_mesh_is_provisioned()) {
         LOG_INF("Device is already provisioned");
-
-        k_work_queue_init(&config_wq);
-        k_work_queue_start(&config_wq, config_wq_stack,
-                           K_THREAD_STACK_SIZEOF(config_wq_stack),
-                           K_PRIO_PREEMPT(1), NULL);
-        k_work_init_delayable(&configure_work, configure_handler);
-        k_work_schedule_for_queue(&config_wq, &configure_work, K_SECONDS(2));
+        configure_retry_count = 0; // reset retry count on startup
+        k_work_schedule_for_queue(&config_wq, &configure_work, K_NO_WAIT);
         return;
     }
 
@@ -298,13 +315,7 @@ static void self_provision(void)
 
     LOG_INF("Device provisioned successfully with address 0x%04X", GATEWAY_ADDR);
 
-    /* Schedule post-provisioning configuration */
-    k_work_queue_init(&config_wq);
-    k_work_queue_start(&config_wq, config_wq_stack,
-                       K_THREAD_STACK_SIZEOF(config_wq_stack),
-                       K_PRIO_PREEMPT(1), NULL);
-    k_work_init_delayable(&configure_work, configure_handler);
-    k_work_schedule_for_queue(&config_wq, &configure_work, K_SECONDS(2));
+    /* Configuration is triggered via prov_complete() */
 }
 
 // ============================================================================
@@ -341,6 +352,7 @@ static uint8_t prov_uuid[16];
 
 static const struct bt_mesh_prov prov = {
     .uuid = prov_uuid,
+    .complete = prov_complete,
 };
 
 // ============================================================================
@@ -359,6 +371,11 @@ const struct bt_mesh_prov *model_handler_prov_init(void)
 
 const struct bt_mesh_comp *model_handler_comp_init(void)
 {
+    k_work_queue_init(&config_wq);
+    k_work_queue_start(&config_wq, config_wq_stack, 
+                       K_THREAD_STACK_SIZEOF(config_wq_stack),
+                       K_PRIO_PREEMPT(1), NULL);
+    k_work_init_delayable(&configure_work, configure_handler);
     return &comp;
 }
 
