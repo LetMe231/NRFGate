@@ -34,11 +34,9 @@ static void bt_ready(int err)
     model_handler_self_provision();
 
     dk_set_led_on(DK_LED1);
-
     printk("=== BLE Mesh Gateway ready ===\n");
     printk("Waiting for sensor data...\n");
 }
-
 
 static void button_handler(uint32_t button_state, uint32_t has_changed)
 {
@@ -50,22 +48,21 @@ static void button_handler(uint32_t button_state, uint32_t has_changed)
     }
 }
 
-
 int main(void)
 {
     int err;
+
     printk("=== BLE Mesh Gateway starting ===\n");
 
     err = dk_buttons_init(button_handler);
     if (err) {
         printk("Button init failed (err %d)\n", err);
     }
+
     err = bt_enable(bt_ready);
     if (err) {
         printk("bt_enable failed (err %d)\n", err);
     }
-
-    
 
     return 0;
 }
