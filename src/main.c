@@ -36,15 +36,22 @@ static void bt_ready(int err)
     dk_set_led_on(DK_LED1);
     printk("=== BLE Mesh Gateway ready ===\n");
     printk("Waiting for sensor data...\n");
+    printk("Press Button 2 to open provisioning window (30 s)\n");
 }
 
 static void button_handler(uint32_t button_state, uint32_t has_changed)
 {
+    /* Button 1: Reset mesh */
     if (has_changed & DK_BTN1_MSK) {
         printk("Resetting mesh...\n");
         bt_mesh_cdb_clear();
         bt_mesh_reset();
         sys_reboot(SYS_REBOOT_WARM);
+    }
+
+    /* Button 2: Open provisioning window (on press only) */
+    if ((has_changed & DK_BTN2_MSK) && (button_state & DK_BTN2_MSK)) {
+        model_handler_start_provisioning();
     }
 }
 
