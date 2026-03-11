@@ -1,0 +1,24 @@
+# ── OpenThread (native 802.15.4 radio on ESP32-C6) ───────────────────────────
+CONFIG_OPENTHREAD_ENABLED=y
+CONFIG_OPENTHREAD_RADIO_NATIVE=y
+CONFIG_OPENTHREAD_COMMISSIONER=n
+CONFIG_OPENTHREAD_JOINER=n
+CONFIG_OPENTHREAD_DIAG=n
+CONFIG_OPENTHREAD_DNS_CLIENT=n
+
+# Thread dataset must match nRF5340 prj.conf values:
+#   channel  = 11
+#   pan_id   = 0xABCD
+#   master_key = 00112233445566778899aabbccddeeff
+
+# ── LwIP: IPv6 support required by OpenThread ────────────────────────────────
+CONFIG_LWIP_IPV6=y
+CONFIG_LWIP_IPV6_NUM_ADDRESSES=8
+
+# ── CoAP (libcoap bundled with ESP-IDF) ──────────────────────────────────────
+CONFIG_COAP_MBEDTLS_PSK=n
+CONFIG_COAP_MBEDTLS_PKI=n
+CONFIG_COAP_OSCORE_SUPPORT=n
+
+# ── FreeRTOS ─────────────────────────────────────────────────────────────────
+CONFIG_FREERTOS_HZ=1000
