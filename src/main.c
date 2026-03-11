@@ -4,6 +4,7 @@
 #include <zephyr/settings/settings.h>
 #include <dk_buttons_and_leds.h>
 #include "model_handler.h"
+#include "thread_handler.h"
 
 static void bt_ready(int err)
 {
@@ -32,6 +33,11 @@ static void bt_ready(int err)
 
     /* Self-provision with hardcoded keys */
     model_handler_self_provision();
+
+    err = thread_handler_init();
+    if (err) {
+        printk("Thread handler init failed (err %d)\n", err);
+    }
 
     dk_set_led_on(DK_LED1);
     printk("=== BLE Mesh Gateway ready ===\n");
