@@ -3,7 +3,9 @@
 # Target: nRF54L15-DK (nRF Connect SDK / Zephyr RTOS)
 # ============================================================
 
-image: nordicplayground/nrfconnect-sdk:main
+image:
+  name: nordicplayground/nrfconnect-sdk:v2.9-branch
+  entrypoint: [""]
 
 stages:
   - lint
