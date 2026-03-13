@@ -3,7 +3,6 @@
 #include <zephyr/net/coap.h>
 #include <zephyr/data/json.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/net/net_if.h>
 #include "thread_handler.h"
 
 /* Realm-local all-nodes multicast – Thread nodes send sensor data here */
@@ -120,6 +119,17 @@ static void coap_rx_thread(void *p1, void *p2, void *p3)
 
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
+    /* Join ff03::1 here – Thread interface may not be ready at init time.
+     * Retry every second until the stack accepts the subscription. */
+    struct ipv6_mreq mreq = { .ipv6mr_ifindex = 0 };
+    inet_pton(AF_INET6, MCAST_ADDR, &mreq.ipv6mr_multiaddr);
+    while (setsockopt(sock, IPPROTO_IPV6, IPV6_JOIN_GROUP,
+                      &mreq, sizeof(mreq)) < 0) {
+        LOG_DBG("Multicast join pending (err %d), retrying in 1 s...", errno);
+        k_sleep(K_SECONDS(1));
+    }
+    LOG_INF("Joined multicast group %s", MCAST_ADDR);
+
     while (running) {
         received = recvfrom(sock, buf, sizeof(buf), 0,
                             (struct sockaddr *)&src, &src_len);
@@ -163,23 +173,6 @@ int thread_handler_init(void)
         close(sock);
         return -errno;
     }
-
-    /* Join ff03::1 so the OS delivers realm-local multicast to this socket */
-    struct ipv6_mreq mreq = {
-        .ipv6mr_ifindex = 0,   /* 0 = default interface (Thread netif) */
-    };
-    if (inet_pton(AF_INET6, MCAST_ADDR, &mreq.ipv6mr_multiaddr) != 1) {
-        LOG_ERR("Invalid multicast address: %s", MCAST_ADDR);
-        close(sock);
-        return -EINVAL;
-    }
-    if (setsockopt(sock, IPPROTO_IPV6, IPV6_JOIN_GROUP,
-                   &mreq, sizeof(mreq)) < 0) {
-        LOG_ERR("IPV6_JOIN_GROUP failed: %d", errno);
-        close(sock);
-        return -errno;
-    }
-    LOG_INF("Joined multicast group %s", MCAST_ADDR);
 
     running = true;
     k_thread_create(&coap_rx_tid, coap_rx_stack,
