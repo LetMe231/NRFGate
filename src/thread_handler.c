@@ -3,7 +3,11 @@
 #include <zephyr/net/coap.h>
 #include <zephyr/data/json.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/net/net_if.h>
 #include "thread_handler.h"
+
+/* Realm-local all-nodes multicast – Thread nodes send sensor data here */
+#define MCAST_ADDR  "ff03::1"
 
 LOG_MODULE_REGISTER(thread_handler, LOG_LEVEL_INF);
 
@@ -159,6 +163,23 @@ int thread_handler_init(void)
         close(sock);
         return -errno;
     }
+
+    /* Join ff03::1 so the OS delivers realm-local multicast to this socket */
+    struct ipv6_mreq mreq = {
+        .ipv6mr_ifindex = 0,   /* 0 = default interface (Thread netif) */
+    };
+    if (inet_pton(AF_INET6, MCAST_ADDR, &mreq.ipv6mr_multiaddr) != 1) {
+        LOG_ERR("Invalid multicast address: %s", MCAST_ADDR);
+        close(sock);
+        return -EINVAL;
+    }
+    if (setsockopt(sock, IPPROTO_IPV6, IPV6_JOIN_GROUP,
+                   &mreq, sizeof(mreq)) < 0) {
+        LOG_ERR("IPV6_JOIN_GROUP failed: %d", errno);
+        close(sock);
+        return -errno;
+    }
+    LOG_INF("Joined multicast group %s", MCAST_ADDR);
 
     running = true;
     k_thread_create(&coap_rx_tid, coap_rx_stack,
