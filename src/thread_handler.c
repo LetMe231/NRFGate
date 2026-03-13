@@ -125,7 +125,7 @@ static void coap_rx_thread(void *p1, void *p2, void *p3)
     inet_pton(AF_INET6, MCAST_ADDR, &mreq.ipv6mr_multiaddr);
     while (setsockopt(sock, IPPROTO_IPV6, IPV6_JOIN_GROUP,
                       &mreq, sizeof(mreq)) < 0) {
-        LOG_DBG("Multicast join pending (err %d), retrying in 1 s...", errno);
+        LOG_WRN("Multicast join pending (err %d), retrying in 1 s...", errno);
         k_sleep(K_SECONDS(1));
     }
     LOG_INF("Joined multicast group %s", MCAST_ADDR);
