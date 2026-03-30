@@ -25,6 +25,7 @@
 #include <dk_buttons_and_leds.h>
 
 #include "model_handler.h"
+#include "data_handler.h"
 
 LOG_MODULE_REGISTER(model_handler, LOG_LEVEL_INF);
 
@@ -42,6 +43,7 @@ extern void mesh_scheduler_start(void);
 #define PROP_TVOC        0x0102
 #define PROP_RAW_RED     0x0103
 #define PROP_RAW_IR      0x0104
+#define PROP_SENSOR_SEQ  0x07FF
 
 /* ── Network Credentials ────────────────────────────────────── */
 
@@ -71,6 +73,9 @@ static const uint8_t app_key[16] = {
 /* ── Sensor Status Opcode ────────────────────────────────────── */
 
 #define BT_MESH_MODEL_OP_SENSOR_STATUS BT_MESH_MODEL_OP_1(0x52)
+
+static uint16_t unprov_target_addr;
+static struct k_work_delayable unprovision_work;
 
 /* ── MPID Parser (Format A) ─────────────────────────────────── */
 
@@ -119,8 +124,9 @@ static uint32_t read_le_unsigned(const uint8_t *data, uint8_t len)
 
 /* ── Sensor Status Payload Parser ────────────────────────────── */
 
-static void process_sensor_status(const uint8_t *data, uint16_t len)
+static void process_sensor_status(const uint8_t *data, uint16_t len, uint16_t src_addr)
 {
+    struct sensor_payload p = {0};
     uint16_t offset = 0;
 
     while (offset + 2 <= len) {
@@ -143,40 +149,73 @@ static void process_sensor_status(const uint8_t *data, uint16_t len)
         offset += data_len;
 
         switch (prop_id) {
+        case PROP_SENSOR_SEQ:
+            p.seq = read_le_unsigned(val, data_len);
+            p.present |= SENSOR_HAS_SEQ;
+            break;
         case PROP_TEMPERATURE: {
-            int32_t t = read_le_signed(val, data_len);
-            LOG_INF("Temperature: %d.%02d C", t / 100, t % 100);
+            // ble mesh: 0.01%RH steps, so multiply by 10 for 0.1°C steps
+            p.temp = read_le_signed(val, data_len) * 10;
+            p.present |= SENSOR_HAS_TEMP;
             break;
         }
         case PROP_HUMIDITY: {
-            uint32_t h = read_le_unsigned(val, data_len);
-            LOG_INF("Humidity: %u.%02u %%", h / 100, h % 100);
+            // ble mesh: 0.01%RH steps, so multiply by 10 for 0.1% steps
+            p.hum = (int32_t)read_le_unsigned(val, data_len) * 10;
+            p.present |= SENSOR_HAS_HUM;
             break;
         }
         case PROP_ECO2:
-            LOG_INF("eCO2: %u ppm", read_le_unsigned(val, data_len));
+            // ppm no scaling
+            p.eco2 = read_le_unsigned(val, data_len);
+            p.present |= SENSOR_HAS_ECO2;
             break;
         case PROP_TVOC:
-            LOG_INF("TVOC: %u ppb", read_le_unsigned(val, data_len));
+            // ppb no scaling
+            p.tvoc = read_le_unsigned(val, data_len);
+            p.present |= SENSOR_HAS_TVOC;
             break;
         case PROP_HEART_RATE:
-            LOG_INF("Heart Rate: %u bpm", read_le_unsigned(val, data_len));
+            // bpm no scaling
+            p.heart_rate = read_le_unsigned(val, data_len);
+            p.present |= SENSOR_HAS_HEART_RATE;
             break;
-        case PROP_SPO2: {
-            uint32_t s = read_le_unsigned(val, data_len);
-            LOG_INF("SpO2: %u.%02u %%", s / 100, s % 100);
+        case PROP_SPO2:
+            // ble mesh: 0.01% steps, so multiply by 10 for 0.1% steps
+            p.spo2 = (int32_t)read_le_unsigned(val, data_len) * 10;
+            p.present |= SENSOR_HAS_SPO2;
             break;
-        }
         case PROP_RAW_RED:
-            LOG_INF("Raw red: %u", read_le_unsigned(val, data_len));
+            // raw sensor value, no scaling
+            p.raw_red = read_le_unsigned(val, data_len);
+            p.present |= SENSOR_HAS_RAW_RED;
             break;
         case PROP_RAW_IR:
-            LOG_INF("Raw IR: %u", read_le_unsigned(val, data_len));
+            // raw sensor value, no scaling
+            p.raw_ir = read_le_unsigned(val, data_len);
+            p.present |= SENSOR_HAS_RAW_IR;
             break;
         default:
             LOG_WRN("Unknown Property 0x%04X (%u bytes)", prop_id, data_len);
         }
     }
+
+    if (p.present == 0) {
+        LOG_WRN("Sensor Status from 0x%04X had no recognised properties",
+                src_addr);
+        return;
+    }
+    // Build node sensor data struct and submit to data handler
+    struct node_sensor_data nd = {
+        .identity = {
+            .transport = NODE_TRANSPORT_BLE_MESH,
+            .mesh_addr = src_addr,
+        },
+        .rx_uptime_ms = k_uptime_get(),
+        .payload = p,
+    };
+
+    data_handler_receive(&nd);
 }
 
 /* ── Sensor Client Opcode Handler ────────────────────────────── */
@@ -186,7 +225,7 @@ static int sensor_status_handler(const struct bt_mesh_model *model,
                                  struct net_buf_simple *buf)
 {
     LOG_INF("Sensor Status from 0x%04X (%u bytes)", ctx->addr, buf->len);
-    process_sensor_status(buf->data, buf->len);
+    process_sensor_status(buf->data, buf->len, ctx->addr);
     return 0;
 }
 
@@ -315,23 +354,29 @@ static void configure_node_handler(struct k_work *work)
     err = bt_mesh_cfg_cli_app_key_add(NET_IDX, addr,
                                       NET_IDX, APP_IDX,
                                       app_key, &status);
-    if (err || status) {
+    if (err == -ETIMEDOUT) {
+        LOG_WRN("  AppKey add timed out (RPL block?) — assuming success");
+    } else if (err || status) {
         LOG_ERR("  AppKey add failed: err=%d status=0x%02X", err, status);
         schedule_node_retry();
         return;
+    } else {
+        LOG_INF("  AppKey added to 0x%04X", addr);
     }
-    LOG_INF("  AppKey added to 0x%04X", addr);
 
     /* 2. Bind to Sensor Server (0x1100) */
     err = bt_mesh_cfg_cli_mod_app_bind(NET_IDX, addr, addr, APP_IDX,
                                        BT_MESH_MODEL_ID_SENSOR_SRV,
                                        &status);
-    if (err || status) {
+    if (err == -ETIMEDOUT) {
+        LOG_WRN("  Bind timed out (RPL block?) — assuming success");
+    } else if (err || status) {
         LOG_ERR("  Bind failed: err=%d status=0x%02X", err, status);
         schedule_node_retry();
         return;
+    } else {
+        LOG_INF("  Bound to Sensor Server");
     }
-    LOG_INF("  Bound to Sensor Server");
 
     /* 3. Set publication to group address */
     struct bt_mesh_cfg_cli_mod_pub pub = {
@@ -346,12 +391,15 @@ static void configure_node_handler(struct k_work *work)
     err = bt_mesh_cfg_cli_mod_pub_set(NET_IDX, addr, addr,
                                       BT_MESH_MODEL_ID_SENSOR_SRV,
                                       &pub, &status);
-    if (err || status) {
+    if (err == -ETIMEDOUT) {
+        LOG_WRN("  Pub set timed out (RPL block?) — assuming success");
+    } else if (err || status) {
         LOG_ERR("  Pub set failed: err=%d status=0x%02X", err, status);
         schedule_node_retry();
         return;
+    } else {
+        LOG_INF("  Publication set to 0x%04X", GROUP_ADDR);
     }
-    LOG_INF("  Publication set to 0x%04X", GROUP_ADDR);
 
    LOG_INF("=== Node 0x%04X fully configured ===", addr);
 
@@ -376,15 +424,30 @@ static void configure_node_handler(struct k_work *work)
 
 static void init_next_node_addr(void)
 {
-    next_node_addr = FIRST_NODE_ADDR;
+    uint16_t addr = bt_mesh_cdb_free_addr_get(1);
 
-    struct bt_mesh_cdb_node *node;
-
-    while ((node = bt_mesh_cdb_node_get(next_node_addr)) != NULL) {
-        next_node_addr += node->num_elem;
+    if (addr == BT_MESH_ADDR_UNASSIGNED) {
+        LOG_ERR("No free node address available");
+        next_node_addr = BT_MESH_ADDR_UNASSIGNED;
+        return;
     }
 
+    next_node_addr = addr;
     LOG_INF("Next available node address: 0x%04X", next_node_addr);
+}
+
+// Debugging
+static uint8_t dump_node(struct bt_mesh_cdb_node *node, void *user_data)
+{
+    LOG_INF("CDB node: addr=0x%04X elem=%u net_idx=0x%04X configured=%d",
+            node->addr, node->num_elem, node->net_idx,
+            atomic_test_bit(node->flags, BT_MESH_CDB_NODE_CONFIGURED));
+    return BT_MESH_CDB_ITER_CONTINUE;
+}
+
+static void dump_cdb_nodes(void)
+{
+    bt_mesh_cdb_node_foreach(dump_node, NULL);
 }
 
 /* ── Provisioning Callbacks ──────────────────────────────────── */
@@ -393,6 +456,9 @@ static void unprovisioned_beacon_cb(uint8_t uuid[16],
                                     bt_mesh_prov_oob_info_t oob_info,
                                     uint32_t *uri_hash)
 {
+    LOG_DBG("Beacon received: %02X%02X scanning=%d", 
+            uuid[0], uuid[1], prov_scanning);
+    
     if (!prov_scanning || prov_in_progress) {
         return;
     }
@@ -400,6 +466,8 @@ static void unprovisioned_beacon_cb(uint8_t uuid[16],
     /* UUID prefix filter */
     if (uuid[0] != ESP32_UUID_PREFIX_0 ||
         uuid[1] != ESP32_UUID_PREFIX_1) {
+        LOG_WRN("UUID prefix mismatch: %02X%02X != %02X%02X",
+                uuid[0], uuid[1], ESP32_UUID_PREFIX_0, ESP32_UUID_PREFIX_1);
         return;
     }
 
@@ -409,6 +477,7 @@ static void unprovisioned_beacon_cb(uint8_t uuid[16],
 
     while ((existing = bt_mesh_cdb_node_get(a)) != NULL) {
         if (memcmp(existing->uuid, uuid, 16) == 0) {
+            LOG_WRN("Node already provisioned at 0x%04X", a);
             return;
         }
         a += existing->num_elem;
@@ -417,6 +486,13 @@ static void unprovisioned_beacon_cb(uint8_t uuid[16],
     LOG_INF("ESP32 node detected: %02X%02X%02X%02X-%02X%02X...",
             uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5]);
 
+    init_next_node_addr();
+    dump_cdb_nodes();
+    if (next_node_addr == BT_MESH_ADDR_UNASSIGNED) {
+    LOG_ERR("No free node address in CDB");
+    prov_in_progress = false;
+    return;
+}
     uint16_t addr = next_node_addr;
 
     LOG_INF("Provisioning at address 0x%04X...", addr);
@@ -454,7 +530,7 @@ static void node_added_cb(uint16_t net_idx, uint8_t uuid[16],
         pending_node_addr = addr;
         node_retry_count = 0;
         k_work_schedule_for_queue(&config_wq, &configure_node_work,
-                                  K_SECONDS(2));
+                                  K_SECONDS(3));
     }
 }
 static void prov_link_close_cb(bt_mesh_prov_bearer_t bearer)
@@ -470,7 +546,7 @@ static void prov_timeout_handler(struct k_work *work)
     LOG_INF("=== Provisioning window closed ===");
     prov_scanning = false;
     bt_mesh_prov_disable(BT_MESH_PROV_ADV);
-    dk_set_led_off(DK_LED2);
+    dk_set_led_off(DK_LED3);
 
     /* Resume radio scheduler */
     mesh_scheduler_start();
@@ -596,6 +672,59 @@ const struct bt_mesh_prov *model_handler_prov_init(void)
 
     return &prov;
 }
+static struct k_work_delayable prov_start_work;
+
+static void prov_start_handler(struct k_work *work)
+{
+    int err = bt_mesh_prov_enable(BT_MESH_PROV_ADV);
+    if (err && err != -EALREADY) {
+        LOG_ERR("Failed to enable provisioner: %d", err);
+        prov_scanning = false;
+        dk_set_led_off(DK_LED3);
+        mesh_scheduler_start();
+        return;
+    }
+    k_work_schedule_for_queue(&config_wq, &prov_timeout_work,
+                              K_SECONDS(PROV_WINDOW_SECONDS));
+}
+
+static void unprovision_handler(struct k_work *work)
+{
+    uint16_t addr = unprov_target_addr;
+    LOG_INF("Unprovisioning node 0x%04X...", addr);
+ 
+    mesh_scheduler_pause();
+ 
+    /* Tell the node to reset itself — it will restart as unprovisioned */
+    int err = bt_mesh_cfg_cli_node_reset(NET_IDX, addr, NULL);
+    if (err && err != -ETIMEDOUT) {
+        /* -ETIMEDOUT is normal if the node is already offline/reset */
+        LOG_WRN("  Node reset message failed: %d (node may already be offline)", err);
+    } else {
+        LOG_INF("  Node reset sent to 0x%04X", addr);
+    }
+ 
+    /* Remove from CDB regardless — even if the node is unreachable,
+     * we want the gateway to forget it so it can be re-provisioned. */
+    struct bt_mesh_cdb_node *node = bt_mesh_cdb_node_get(addr);
+    if (node) {
+        bt_mesh_cdb_node_del(node, true);
+        LOG_INF("  Removed 0x%04X from CDB", addr);
+    } else {
+        LOG_WRN("  Node 0x%04X not found in CDB", addr);
+    }
+    
+    k_sleep(K_MSEC(200));
+    /* Recalculate next available address in case this freed a slot */
+    init_next_node_addr();
+    dump_cdb_nodes();
+ 
+    if (IS_ENABLED(CONFIG_SETTINGS)) settings_save();
+ 
+    LOG_INF("=== Node 0x%04X unprovisioned ===", addr);
+    mesh_scheduler_start();
+}
+ 
 
 const struct bt_mesh_comp *model_handler_comp_init(void)
 {
@@ -607,6 +736,8 @@ const struct bt_mesh_comp *model_handler_comp_init(void)
     k_work_init_delayable(&configure_work, configure_handler);
     k_work_init_delayable(&configure_node_work, configure_node_handler);
     k_work_init_delayable(&prov_timeout_work, prov_timeout_handler);
+    k_work_init_delayable(&prov_start_work, prov_start_handler);
+    k_work_init_delayable(&unprovision_work, unprovision_handler);
 
     return &comp;
 }
@@ -616,38 +747,35 @@ void model_handler_self_provision(void)
     self_provision();
 }
 
+
 void model_handler_start_provisioning(void)
 {
     if (prov_scanning) {
         LOG_INF("Provisioning window already open");
         return;
     }
-
     if (!bt_mesh_is_provisioned()) {
         LOG_WRN("Gateway not provisioned yet");
         return;
     }
 
-    /* Pause scheduler — mesh needs uninterrupted radio for provisioning */
     mesh_scheduler_pause();
+    prov_scanning = true;
+    dk_set_led_on(DK_LED3);
 
     LOG_INF("=== Provisioning window open (%d s) ===", PROV_WINDOW_SECONDS);
     LOG_INF("Looking for ESP32 nodes (UUID prefix %02X %02X)...",
             ESP32_UUID_PREFIX_0, ESP32_UUID_PREFIX_1);
 
-    prov_scanning = true;
-    dk_set_led_on(DK_LED2);
+    /* Delay prov_enable 500ms to let BLE stack settle */
+    k_work_schedule_for_queue(&config_wq, &prov_start_work, K_MSEC(500));
+}
 
-    int err = bt_mesh_prov_enable(BT_MESH_PROV_ADV);
 
-    if (err && err != -EALREADY) {
-        LOG_ERR("Failed to enable provisioner: %d", err);
-        prov_scanning = false;
-        dk_set_led_off(DK_LED2);
-        mesh_scheduler_start();
-        return;
-    }
+ 
 
-    k_work_schedule_for_queue(&config_wq, &prov_timeout_work,
-                              K_SECONDS(PROV_WINDOW_SECONDS));
+void model_handler_unprovision_node(uint16_t mesh_addr)
+{
+    unprov_target_addr = mesh_addr;
+    k_work_schedule_for_queue(&config_wq, &unprovision_work, K_MSEC(100));
 }

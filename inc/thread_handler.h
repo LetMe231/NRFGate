@@ -10,5 +10,6 @@
  * @return 0 on success, negative errno on failure.
  */
 int thread_handler_init(void);
+void thread_handler_nus_ready(void);
 
 #endif /* THREAD_HANDLER_H */
