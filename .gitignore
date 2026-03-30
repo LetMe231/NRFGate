@@ -2,3 +2,4 @@ build*/
 out*/
 .vscode*/
 inc/mesh_keys.h
+tests/test_logic
