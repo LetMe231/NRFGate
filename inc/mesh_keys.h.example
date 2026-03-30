@@ -1,0 +1,24 @@
+/**
+ * @file mesh_keys.h.example
+ * @brief Template for mesh_keys.h — copy to inc/mesh_keys.h and fill in keys.
+ *
+ * Generate random keys with:
+ *   python3 -c "import os; print(', '.join(hex(b) for b in os.urandom(16)))"
+ *
+ * The same keys must be flashed on all sensor nodes in the network.
+ */
+
+#ifndef MESH_KEYS_H
+#define MESH_KEYS_H
+
+/* 128-bit BLE Mesh Network Key */
+#define MESH_NET_KEY \
+    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, \
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
+
+/* 128-bit BLE Mesh Application Key */
+#define MESH_APP_KEY \
+    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, \
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
+
+#endif /* MESH_KEYS_H */

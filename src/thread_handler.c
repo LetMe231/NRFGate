@@ -177,6 +177,11 @@ static void coap_rx_thread(void *p1, void *p2, void *p3)
     /* Wait for OpenThread interface to come up */
     struct net_if *iface = net_if_get_default();
 
+    if (!iface) {
+        LOG_ERR("No network interface found");
+        return;
+    }
+
     while (!net_if_is_up(iface)) {
         LOG_INF("Waiting for network interface...");
         k_sleep(K_SECONDS(1));

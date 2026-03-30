@@ -26,6 +26,7 @@
 
 #include "model_handler.h"
 #include "data_handler.h"
+#include "mesh_keys.h"
 
 LOG_MODULE_REGISTER(model_handler, LOG_LEVEL_INF);
 
@@ -47,15 +48,8 @@ extern void mesh_scheduler_start(void);
 
 /* ── Network Credentials ────────────────────────────────────── */
 
-static const uint8_t net_key[16] = {
-    0xF3, 0x43, 0xBB, 0xCD, 0x11, 0x48, 0x9F, 0x37,
-    0x21, 0xF3, 0x23, 0xAC, 0xD0, 0x72, 0x9E, 0xBA,
-};
-
-static const uint8_t app_key[16] = {
-    0xFC, 0x00, 0x10, 0x2B, 0xC3, 0xBD, 0x0E, 0x62,
-    0x19, 0xCC, 0xB1, 0x90, 0xB1, 0x0A, 0x88, 0xA9,
-};
+static const uint8_t net_key[16] = MESH_NET_KEY;
+static const uint8_t app_key[16] = MESH_APP_KEY;
 
 #define NET_IDX      0x0000
 #define APP_IDX      0x0000
@@ -356,7 +350,7 @@ static void configure_node_handler(struct k_work *work)
                                       app_key, &status);
     if (err == -ETIMEDOUT) {
         LOG_WRN("  AppKey add timed out (RPL block?) — assuming success");
-    } else if (err || status) {
+    } else if (err && err != -EALREADY) {
         LOG_ERR("  AppKey add failed: err=%d status=0x%02X", err, status);
         schedule_node_retry();
         return;

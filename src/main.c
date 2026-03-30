@@ -232,8 +232,8 @@ static void bt_ready(int err)
 
 static void button_handler(uint32_t button_state, uint32_t has_changed)
 {
-    /* Button 1: Factory reset */
-    if (has_changed & DK_BTN4_MSK) {
+    /* Button 4: Factory reset */
+    if ((has_changed & DK_BTN4_MSK) && (button_state & DK_BTN4_MSK)) {
         LOG_INF("Factory reset triggered");
         bt_mesh_cdb_clear();
         bt_mesh_reset();
