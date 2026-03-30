@@ -21,7 +21,6 @@
 #include "model_handler.h"
 #include "ble_nus.h"
 #include "lora_handler.h"
-#include "model_handler.h"
 #include "main.h"
 #include "semantic_handler.h"
 
@@ -190,71 +189,76 @@ static int build_json(const struct node_sensor_data *d,
 {
     const struct sensor_payload *p = &d->payload;
     int off = 0;
+    int rem;
+
+#define JSON_APPEND(...) do {                                    \
+    rem = (int)size - off;                                       \
+    if (rem <= 0) { goto overflow; }                             \
+    off += snprintf(buf + off, (size_t)rem, __VA_ARGS__);        \
+} while (0)
 
     // Header: node index + transport tag
     const char *tr_tag = (d->identity.transport == NODE_TRANSPORT_BLE_MESH) ? "B" : "T";
     const char *state = semantic_handler_state_str(semantic_handler_get_state(d->node_idx));
-    off += snprintf(buf + off, size - off, "{\"node\":%d,\"tr\":\"%s\",\"state\":\"%s\"", d->node_idx, tr_tag, state);
-    if(p->present & SENSOR_HAS_SEQ){
-        off += snprintf(buf + off, size - off, ",\"seq\":%d", p->seq);
+    JSON_APPEND("{\"node\":%d,\"tr\":\"%s\",\"state\":\"%s\"", d->node_idx, tr_tag, state);
+    if (p->present & SENSOR_HAS_SEQ) {
+        JSON_APPEND(",\"seq\":%d", p->seq);
     }
-
     if (d->identity.transport == NODE_TRANSPORT_BLE_MESH) {
-        off += snprintf(buf + off, size - off,
-                        ",\"mesh_addr\":%d", d->identity.mesh_addr);
+        JSON_APPEND(",\"mesh_addr\":%d", d->identity.mesh_addr);
     }
 
-    // IMU — only for Thread/IMU nodes 
+    // IMU — only for Thread/IMU nodes
     if ((p->present & SENSOR_HAS_ACCEL) == SENSOR_HAS_ACCEL) {
-        off += snprintf(buf + off, size - off,
-                        ",\"ax\":%d.%03d,\"ay\":%d.%03d,\"az\":%d.%03d",
-                        p->ax / 1000, abs(p->ax % 1000),
-                        p->ay / 1000, abs(p->ay % 1000),
-                        p->az / 1000, abs(p->az % 1000));
+        JSON_APPEND(",\"ax\":%d.%03d,\"ay\":%d.%03d,\"az\":%d.%03d",
+                    p->ax / 1000, abs(p->ax % 1000),
+                    p->ay / 1000, abs(p->ay % 1000),
+                    p->az / 1000, abs(p->az % 1000));
     }
     if ((p->present & SENSOR_HAS_GYRO) == SENSOR_HAS_GYRO) {
-        off += snprintf(buf + off, size - off,
-                        ",\"gx\":%d.%03d,\"gy\":%d.%03d,\"gz\":%d.%03d",
-                        p->gx / 1000, abs(p->gx % 1000),
-                        p->gy / 1000, abs(p->gy % 1000),
-                        p->gz / 1000, abs(p->gz % 1000));
+        JSON_APPEND(",\"gx\":%d.%03d,\"gy\":%d.%03d,\"gz\":%d.%03d",
+                    p->gx / 1000, abs(p->gx % 1000),
+                    p->gy / 1000, abs(p->gy % 1000),
+                    p->gz / 1000, abs(p->gz % 1000));
     }
- 
+
     // Environmental — shared
     if (p->present & SENSOR_HAS_TEMP) {
-        off += snprintf(buf + off, size - off, ",\"temp\":%d.%01d",
-                        p->temp / 1000, abs((p->temp % 1000) / 100));
+        JSON_APPEND(",\"temp\":%d.%01d",
+                    p->temp / 1000, abs((p->temp % 1000) / 100));
     }
     if (p->present & SENSOR_HAS_HUM) {
-        off += snprintf(buf + off, size - off, ",\"hum\":%d.%01d",
-                        p->hum / 1000, abs((p->hum % 1000) / 100));
+        JSON_APPEND(",\"hum\":%d.%01d",
+                    p->hum / 1000, abs((p->hum % 1000) / 100));
     }
- 
-    // Air quality — shared 
+
+    // Air quality — shared
     if (p->present & SENSOR_HAS_TVOC) {
-        off += snprintf(buf + off, size - off, ",\"tvoc\":%d", p->tvoc);
+        JSON_APPEND(",\"tvoc\":%d", p->tvoc);
     }
     if (p->present & SENSOR_HAS_ECO2) {
-        off += snprintf(buf + off, size - off, ",\"eco2\":%d", p->eco2);
+        JSON_APPEND(",\"eco2\":%d", p->eco2);
     }
- 
-    // Biometric — BLE Mesh only 
+
+    // Biometric — BLE Mesh only
     if (p->present & SENSOR_HAS_HEART_RATE) {
-        off += snprintf(buf + off, size - off, ",\"hr\":%d", p->heart_rate);
+        JSON_APPEND(",\"hr\":%d", p->heart_rate);
     }
     if (p->present & SENSOR_HAS_SPO2) {
-        off += snprintf(buf + off, size - off, ",\"spo2\":%d.%01d",
-                        p->spo2 / 1000, abs((p->spo2 % 1000) / 100));
+        JSON_APPEND(",\"spo2\":%d.%01d",
+                    p->spo2 / 1000, abs((p->spo2 % 1000) / 100));
     }
- 
-    // Close + newline (BLE NUS convention from original code) 
-    off += snprintf(buf + off, size - off, "}\n");
- 
-    if (off >= (int)size) {
-        LOG_ERR("JSON buffer overflow (%d >= %d)", off, (int)size);
-        return 0;
-    }
+
+    // Close + newline
+    JSON_APPEND("}\n");
+
+#undef JSON_APPEND
+
     return off;
+
+overflow:
+    LOG_ERR("JSON buffer overflow at off=%d size=%d", off, (int)size);
+    return 0;
 };
 
 // TLV serializer for LoRa binary forwarding
@@ -513,20 +517,21 @@ void data_handler_cmd(const char *cmd, uint16_t len)
         return;
     }
     /* ── lora_enabled ────────────────────────────────────────────*/
-    const char *p = strstr(cmd, "\"lora_enabled\"");
-    if (!p) { LOG_WRN("Unknown command: %.*s", len, cmd); return; }
- 
-    p = strchr(p, ':');
-    if (!p) { LOG_WRN("Malformed lora_enabled command"); return; }
-    while (*++p == ' ' || *p == '\t') {}
- 
-    if (strncmp(p, "true", 4) == 0) {
-        atomic_set(&lora_enabled, 1);
-        k_sem_give(&lora_wake_sem);
-        LOG_INF("LoRa enabled");
-    } else if (strncmp(p, "false", 5) == 0) {
-        atomic_set(&lora_enabled, 0);
-        LOG_INF("LoRa disabled");
+    if (strstr(cmd, "\"lora_enabled\"")) {
+        const char *p = strstr(cmd, "\"lora_enabled\"");
+        p = strchr(p, ':');
+        if (!p) { LOG_WRN("Malformed lora_enabled command"); return; }
+        while (*++p == ' ' || *p == '\t') {}
+
+        if (strncmp(p, "true", 4) == 0) {
+            atomic_set(&lora_enabled, 1);
+            k_sem_give(&lora_wake_sem);
+            LOG_INF("LoRa enabled");
+        } else if (strncmp(p, "false", 5) == 0) {
+            atomic_set(&lora_enabled, 0);
+            LOG_INF("LoRa disabled");
+        }
+        return;
     }
 
     /* ── set policy ───────────────────────────────────────
@@ -575,4 +580,6 @@ void data_handler_cmd(const char *cmd, uint16_t len)
         LOG_INF("Policy applied");
         return;
     }
+
+    LOG_WRN("Unknown command: %.*s", len, cmd);
 }

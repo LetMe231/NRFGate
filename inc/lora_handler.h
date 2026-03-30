@@ -12,11 +12,11 @@
 int lora_handler_init(void);
 
 /**
- * @brief Send data via LoRa.
+ * @brief Send binary data via LoRa.
  *
- * @param json The JSON string to send.
- * @param json_len The length of the JSON string.
+ * @param data   Binary payload to transmit.
+ * @param len    Length of the payload in bytes.
  */
-void lora_handler_send(const char *json, uint8_t json_len);
+void lora_handler_send(const uint8_t *data, uint8_t len);
 
 #endif /* LORA_HANDLER_H */
