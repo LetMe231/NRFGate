@@ -37,6 +37,8 @@ typedef struct{
 static node_entry_t node_table[MAX_NODES];
 static uint8_t      node_count = 0;
 
+static K_MUTEX_DEFINE(s_node_mutex);
+
 node_actuator_state_t node_actuator_state[MAX_NODES] = {0};
 
 uint8_t data_handler_get_node_idx_by_mesh_addr(uint16_t mesh_addr)
@@ -69,17 +71,17 @@ static bool identity_match(const node_identity_t *a, const node_identity_t *b){
     }
 }
 
-const char *identity_str(const node_identity_t *id){
-    static char buf[NODE_ADDR_STR_LEN];
+void identity_str(const node_identity_t *id, char *buf, size_t len){
     switch(id->transport){
         case NODE_TRANSPORT_THREAD:
-            return id->ipv6;
+            strncpy(buf, id->ipv6, len);
+            break;
         case NODE_TRANSPORT_BLE_MESH:
-            snprintf(buf, sizeof(buf), "ble:0x%04X", id->mesh_addr);
-            return buf;
+            snprintf(buf, len, "ble:0x%04X", id->mesh_addr);
+            break;
         default:
-            snprintf(buf, sizeof(buf), "Unknown");
-            return buf;
+            snprintf(buf, len, "Unknown");
+            break;
     }
 }
 
@@ -95,6 +97,7 @@ static const char *transport_str(node_transport_t t)
 
  static uint8_t register_or_find_node(const node_identity_t *id, int64_t now_ms){
     // node already exists?
+    k_mutex_lock(&s_node_mutex, K_FOREVER);
     for(uint8_t i=0; i<node_count; i++){
         if(identity_match(&node_table[i].identity, id)){
             node_table[i].last_seen_ms = now_ms;
@@ -105,8 +108,10 @@ static const char *transport_str(node_transport_t t)
 
     // new node
     if(node_count >= MAX_NODES){
+        char id_str[NODE_ADDR_STR_LEN];
+        identity_str(id, id_str, sizeof(id_str));
         LOG_ERR("Node table full (%d/%d), dropping %s",
-                node_count, MAX_NODES, identity_str(id));
+                node_count, MAX_NODES, id_str);
         return 0xFF;
     }
     
@@ -115,9 +120,12 @@ static const char *transport_str(node_transport_t t)
     node_table[idx].first_seen_ms  = now_ms;
     node_table[idx].last_seen_ms   = now_ms;
     node_table[idx].packet_count   = 1;
- 
+    
+    char id_str[NODE_ADDR_STR_LEN];
+    identity_str(id, id_str, sizeof(id_str));
     LOG_INF("New node [%d] %s addr=%s",
-            idx, transport_str(id->transport), identity_str(id));
+            idx, transport_str(id->transport), id_str);
+    k_mutex_unlock(&s_node_mutex);
     return idx;
 }
 
@@ -127,7 +135,8 @@ static const char *transport_str(node_transport_t t)
 
 static void log_sensor_data(const struct node_sensor_data *d){
     const struct sensor_payload *p = &d->payload;
-    const char *src = identity_str(&d->identity);
+    char src[NODE_ADDR_STR_LEN];
+    identity_str(&d->identity, src, sizeof(src));
     const char *tr = transport_str(d->identity.transport);
     char hdr[80];
     snprintf(hdr, sizeof(hdr), "[Node %d | %s | %s] rx=%lld ms seq=%d", d->node_idx, tr, src, (long long )d->rx_uptime_ms, d->payload.seq);
@@ -205,7 +214,7 @@ static void log_sensor_data(const struct node_sensor_data *d){
  *
  * Returns bytes written (excl. null terminator), or 0 on overflow.
  */
-#define JSON_BUF_SIZE 220
+#define JSON_BUF_SIZE 320
 
 static int build_json(const struct node_sensor_data *d,
                       char *buf, size_t size)
@@ -419,8 +428,10 @@ static void lora_send_thread(void *p1, void *p2, void *p3)
             LOG_DBG("LoRa forwarding enabled, waking up...");
         }
         if (k_msgq_get(&lora_msgq, &frame, K_FOREVER) == 0) {
-            LOG_DBG("LoRa TX %d bytes", frame.len);
-            lora_handler_send(frame.data, frame.len);
+            if (atomic_get(&lora_enabled)) {
+                LOG_DBG("LoRa TX %d bytes", frame.len);
+                lora_handler_send(frame.data, frame.len);
+            }
         }
     }
 }
@@ -652,6 +663,16 @@ void data_handler_cmd(const char *cmd, uint16_t len)
             atomic_set(&lora_enabled, 0);
             LOG_INF("LoRa disabled");
         }
+        return;
+    }
+    /* ── reconfigure ──────────────────────────────────────────────*/
+    if (strstr(cmd, "\"reconfigure\"")) {
+        const char *p = strstr(cmd, "\"mesh_addr\"");
+        if (!p) { LOG_WRN("reconfigure: missing mesh_addr"); return; }
+        p = strchr(p, ':');
+        if (!p) { LOG_WRN("reconfigure: malformed"); return; }
+        uint16_t mesh_addr = (uint16_t)atoi(p + 1);
+        model_handler_reconfigure_node(mesh_addr);
         return;
     }
 

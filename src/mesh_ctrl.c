@@ -59,13 +59,13 @@ void mesh_ctrl_set_onoff(uint16_t addr, bool on)
     LOG_INF("Sent OnOff Set to 0x%04X: %s", addr, on ? "ON" : "OFF");
 
     // Optimistically update cache (since unacknowledged)
-    uint8_t idx = (int8_t)(addr & (STATE_CACHE_SIZE - 1));
+    uint8_t idx = (uint8_t)(addr & (STATE_CACHE_SIZE - 1));
     s_state[idx] = on ? 1 : 0; // update cache with new state
 }
 
 void mesh_ctrl_toggle(uint16_t addr)
 {
-    uint8_t idx = (int8_t)(addr & (STATE_CACHE_SIZE - 1));
+    uint8_t idx = (uint8_t)(addr & (STATE_CACHE_SIZE - 1));
     uint8_t current = s_state[idx];
     // unknown state, default to OFF -> toggle to ON
     mesh_ctrl_set_onoff(addr, current == 1 ? false : true);

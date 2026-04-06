@@ -86,11 +86,14 @@ static void fire(const gateway_rule_t *r, node_transport_t src_transport)
         }
         LOG_INF("Rule -> Mesh %s [0x%04X]", r->action == RULE_ACT_MESH_TOGGLE ? "TOGGLE" : light_on ? "ON" : "OFF", r->target.mesh_addr);
     }
-
-    // Update actuator cache
-    if (update_cache && r->src_node_idx < MAX_NODES) {
-       node_actuator_state[r->src_node_idx].known = true;
-       node_actuator_state[r->src_node_idx].light_on = light_on;
+    if (update_cache) {
+        uint8_t target_idx = 0xFF;
+        target_idx = data_handler_get_node_idx_by_mesh_addr(r->target.mesh_addr);
+        // Update actuator cache
+        if (target_idx < MAX_NODES) {
+            node_actuator_state[target_idx].known = true;
+            node_actuator_state[target_idx].light_on = light_on;
+        }
     }
     /* Nach 1000ms zurück auf Source-Transport für Status-Updates */
     k_work_reschedule(&restore_src_work, K_MSEC(1000));
@@ -120,30 +123,44 @@ void rule_engine_init(void)
 
 void rule_engine_on_state(uint8_t node_idx, node_state_t new_state, node_transport_t src_transport)
 {
+    gateway_rule_t to_fire[RULE_MAX];
+    int fire_count = 0;
+
+    // only match under mutex, but fire outside to avoid blocking semantic handler
     k_mutex_lock(&s_mutex, K_FOREVER);
     for (int i = 0; i < RULE_MAX; i++) {
         if (!s_rules[i].active) continue;
         if (s_rules[i].src_node_idx != node_idx) continue;
         if (!trigger_matches_state(s_rules[i].trigger, new_state)) continue;
-        LOG_INF("Rule[%d] fired: node=%d state=%d", i, node_idx, new_state);
-        fire(&s_rules[i], src_transport);
+        to_fire[fire_count++] = s_rules[i];
     }
     k_mutex_unlock(&s_mutex);
+    for (int i = 0; i < fire_count; i++) {
+        LOG_INF("Rule[%d] fired: node=%d state=%d", i, node_idx, new_state);
+        fire(&to_fire[i], src_transport);
+    }
 }
 
 void rule_engine_on_switch(uint8_t node_idx, bool sw_on, node_transport_t src_transport)
 {
+    gateway_rule_t to_fire[RULE_MAX];
+    int fire_count = 0;
+    
     rule_trigger_t trig = sw_on ? RULE_TRIG_SWITCH_ON : RULE_TRIG_SWITCH_OFF;
     k_mutex_lock(&s_mutex, K_FOREVER);
     for (int i = 0; i < RULE_MAX; i++) {
         if (!s_rules[i].active) continue;
         if (s_rules[i].src_node_idx != node_idx) continue;
         if (s_rules[i].trigger != trig) continue;
-        LOG_INF("Rule[%d] fired: node=%d switch=%s", i, node_idx,
-                sw_on ? "ON" : "OFF");
-        fire(&s_rules[i], src_transport);
+        to_fire[fire_count++] = s_rules[i];
     }
     k_mutex_unlock(&s_mutex);
+
+    for (int i = 0; i < fire_count; i++) {
+        LOG_INF("Rule[%d] fired: node=%d switch=%s", i, node_idx,
+                sw_on ? "ON" : "OFF");
+        fire(&to_fire[i], src_transport);
+    }
 }
 
 int rule_engine_add(const gateway_rule_t *rule)

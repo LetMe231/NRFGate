@@ -124,7 +124,7 @@ static int sensors_post(struct coap_resource *resource,
     }
 
     // Ignore discovery packets
-    if (payload_len >= 0){
+    if (payload_len > 11){
         const char *pl = (const char *)payload;
         if (memchr(pl, 'd', payload_len) && strncmp(pl, "{\"discover\"", MIN(payload_len, 11)) == 0){
             LOG_INF("Ignoring discovery packet from %s", id.ipv6);

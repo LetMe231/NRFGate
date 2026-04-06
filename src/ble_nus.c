@@ -12,6 +12,8 @@ LOG_MODULE_REGISTER(ble_nus, LOG_LEVEL_INF);
 
 static struct bt_conn *current_conn = NULL;
 static bool att_ready = false;
+    static char s_cmd_buf[256];
+    static size_t s_cmd_len = 0;
 
 static void nus_send_enabled(enum bt_nus_send_status status)
 {
@@ -27,8 +29,6 @@ static void nus_send_enabled(enum bt_nus_send_status status)
 static void nus_received(struct bt_conn *conn,
                          const uint8_t *data, uint16_t len)
 {
-    static char cmd_buf[256];
-    static size_t cmd_len = 0;
     for (uint16_t i = 0; i < len; i++) {
             char c = (char)data[i];
 
@@ -37,21 +37,27 @@ static void nus_received(struct bt_conn *conn,
             }
 
             if (c == '\n') {
-                cmd_buf[cmd_len] = '\0';
+                s_cmd_buf[s_cmd_len] = '\0';
 
-                if (cmd_len > 0) {
-                    LOG_INF("Full NUS cmd: %s", cmd_buf);
-                    data_handler_cmd(cmd_buf, cmd_len);
+                if (s_cmd_len > 0) {
+                    LOG_INF("Full NUS cmd: %s", s_cmd_buf);
+                    data_handler_cmd(s_cmd_buf, s_cmd_len);
                 }
-                cmd_len = 0;
+                s_cmd_len = 0;
                 continue;
             }
 
-            if (cmd_len < 256 - 1) {
-                cmd_buf[cmd_len++] = c;
+            // Reject invalid bytes
+            if ((uint8_t) c < 0x20 || (uint8_t) c > 0x7E) {
+                LOG_WRN("Invalid byte in NUS cmd: 0x%02X", c);
+                s_cmd_len = 0;
+                continue;
+            }
+            if (s_cmd_len < sizeof(s_cmd_buf) - 1) {
+                s_cmd_buf[s_cmd_len++] = c;
             } else {
                 LOG_WRN("NUS cmd buffer overflow, dropping command");
-                cmd_len = 0;
+                s_cmd_len = 0;
             }
         }
 }
@@ -117,7 +123,9 @@ static void connected(struct bt_conn *conn, uint8_t err)
 {
     if (!err) {
         current_conn = bt_conn_ref(conn);
-        att_ready = false;  // ← reset bei neuer Verbindung
+        att_ready = false;
+        s_cmd_len = 0;
+        memset(s_cmd_buf, 0, sizeof(s_cmd_buf));
         LOG_INF("NUS client connected");
     }
 }
@@ -128,6 +136,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
         bt_conn_unref(current_conn);
         current_conn = NULL;
         att_ready = false;
+        s_cmd_len = 0;
+        memset(s_cmd_buf, 0, sizeof(s_cmd_buf));
         LOG_INF("NUS client disconnected");
         int err = ble_nus_advertise();
         if(err){

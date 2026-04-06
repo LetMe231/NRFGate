@@ -29,8 +29,12 @@
 #include "ble_nus.h"
 #include "mesh_ctrl.h"
 #include "data_handler.h"
+#include "semantic_handler.h"
 
 LOG_MODULE_REGISTER(model_handler, LOG_LEVEL_INF);
+
+static bool s_unprov_pending = false;       // True when device has been unprovisioned -> pending guard
+K_MUTEX_DEFINE(s_pending_mutex);
 
 /* Scheduler control (defined in main.c) */
 extern void mesh_scheduler_pause(void);
@@ -373,6 +377,7 @@ static void schedule_node_retry(void)
     LOG_WRN("Node config retry #%d in %u ms",
             node_retry_count + 1, delay_ms);
     node_retry_count++;
+    mesh_scheduler_start();
     k_work_schedule_for_queue(&config_wq, &configure_node_work,
                               K_MSEC(delay_ms));
 }
@@ -498,6 +503,18 @@ static void dump_cdb_nodes(void)
     bt_mesh_cdb_node_foreach(dump_node, NULL);
 }
 
+static uint8_t evict_lost_node_cb(struct bt_mesh_cdb_node *node, void *user_data)
+{
+    // Prüfe ob dieser Node im data_handler als LOST gilt
+    uint8_t idx = data_handler_get_node_idx_by_mesh_addr(node->addr);
+    if (idx != 0xFF && semantic_handler_get_state(idx) == NODE_STATE_LOST) {
+        LOG_WRN("Evicting LOST node 0x%04X from CDB", node->addr);
+        bt_mesh_cdb_node_del(node, true);
+        return BT_MESH_CDB_ITER_STOP;
+    }
+    return BT_MESH_CDB_ITER_CONTINUE;
+}
+
 /* ── Provisioning Callbacks ──────────────────────────────────── */
 
 static void unprovisioned_beacon_cb(uint8_t uuid[16],
@@ -546,10 +563,15 @@ static void unprovisioned_beacon_cb(uint8_t uuid[16],
     init_next_node_addr();
     dump_cdb_nodes();
     if (next_node_addr == BT_MESH_ADDR_UNASSIGNED) {
-    LOG_ERR("No free node address in CDB");
-    prov_in_progress = false;
-    return;
-}
+        bt_mesh_cdb_node_foreach(evict_lost_node_cb, NULL);
+        init_next_node_addr();
+        if (next_node_addr == BT_MESH_ADDR_UNASSIGNED) {
+            LOG_ERR("CDB still full after eviction");
+            if (ble_nus_is_ready()) ble_nus_send("{\"type\":\"error\",\"msg\":\"CDB full\"}\n");
+            prov_in_progress = false;
+            return;
+        }
+    }
     uint16_t addr = next_node_addr;
 
     LOG_INF("Provisioning at address 0x%04X...", addr);
@@ -562,7 +584,20 @@ static void unprovisioned_beacon_cb(uint8_t uuid[16],
     }
 }
 
-
+void model_handler_reconfigure_node(uint16_t mesh_addr)
+{
+    struct bt_mesh_cdb_node *node = bt_mesh_cdb_node_get(mesh_addr);
+    if (!node) {
+        LOG_WRN("reconfigure: node 0x%04X not in CDB", mesh_addr);
+        return;
+    }
+    // CONFIGURED-Flag löschen → configure_node_handler läuft neu durch
+    atomic_clear_bit(node->flags, BT_MESH_CDB_NODE_CONFIGURED);
+    pending_node_addr = mesh_addr;
+    node_retry_count  = 0;
+    k_work_schedule_for_queue(&config_wq, &configure_node_work, K_MSEC(500));
+    LOG_INF("Reconfigure queued for 0x%04X", mesh_addr);
+}
 
 static void node_added_cb(uint16_t net_idx, uint8_t uuid[16],
                            uint16_t addr, uint8_t num_elem)
@@ -577,10 +612,12 @@ static void node_added_cb(uint16_t net_idx, uint8_t uuid[16],
         bt_mesh_cdb_node_store(node);
     }
 
+    k_mutex_lock(&s_pending_mutex, K_FOREVER);
     /* Queue the address for configuration */
     if (pending_count < MAX_PENDING_NODES) {
         pending_addrs[pending_count++] = addr;
     }
+    k_mutex_unlock(&s_pending_mutex);
 
     /* Only start config if this is the first in queue */
     if (pending_count == 1) {
@@ -752,18 +789,19 @@ static void unprovision_handler(struct k_work *work)
 {
     uint16_t addr = unprov_target_addr;
     LOG_INF("Unprovisioning node 0x%04X...", addr);
- 
     mesh_scheduler_pause();
- 
     /* Tell the node to reset itself — it will restart as unprovisioned */
     int err = bt_mesh_cfg_cli_node_reset(NET_IDX, addr, NULL);
-    if (err && err != -ETIMEDOUT) {
-        /* -ETIMEDOUT is normal if the node is already offline/reset */
-        LOG_WRN("  Node reset message failed: %d (node may already be offline)", err);
+    if (err == 0) {
+        LOG_INF("  Node reset command sent successfully");
+    } else if (err == -ETIMEDOUT) {
+        LOG_WRN("  Reset timed out for 0x%04X (node may be offline)", addr);
+    } else if (err == -ENOENT) {
+        LOG_INF("  No DevKey for 0x%04X — skipping reset (node will re-beacon)", addr);
     } else {
-        LOG_INF("  Node reset sent to 0x%04X", addr);
+        LOG_ERR("  Failed to send reset: %d", err);
     }
- 
+
     /* Remove from CDB regardless — even if the node is unreachable,
      * we want the gateway to forget it so it can be re-provisioned. */
     struct bt_mesh_cdb_node *node = bt_mesh_cdb_node_get(addr);
@@ -782,6 +820,7 @@ static void unprovision_handler(struct k_work *work)
     if (IS_ENABLED(CONFIG_SETTINGS)) settings_save();
  
     LOG_INF("=== Node 0x%04X unprovisioned ===", addr);
+    s_unprov_pending = false;
     mesh_scheduler_start();
 }
  
@@ -837,6 +876,11 @@ void model_handler_start_provisioning(void)
 
 void model_handler_unprovision_node(uint16_t mesh_addr)
 {
+    if (s_unprov_pending) {
+        LOG_WRN("Unprovision already in progress, ignoring 0x%04X", mesh_addr);
+        return;
+    }
+    s_unprov_pending = true;
     unprov_target_addr = mesh_addr;
     k_work_schedule_for_queue(&config_wq, &unprovision_work, K_MSEC(100));
 }

@@ -21,5 +21,6 @@ void model_handler_start_provisioning(void);
  */
 void model_handler_unprovision_node(uint16_t mesh_addr);
  
+void model_handler_reconfigure_node(uint16_t mesh_addr);
 #endif /* MODEL_HANDLER_H */
  

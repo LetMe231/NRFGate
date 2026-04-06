@@ -139,4 +139,6 @@ void data_handler_receive(const struct node_sensor_data *data);
 
 void data_handler_cmd(const char *cmd, uint16_t len);
 
+uint8_t data_handler_get_node_idx_by_mesh_addr(uint16_t mesh_addr);
+
 #endif /* DATA_HANDLER_H */
