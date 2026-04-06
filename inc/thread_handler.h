@@ -11,5 +11,6 @@
  */
 int thread_handler_init(void);
 void thread_handler_nus_ready(void);
+int thread_handler_coap_put_light(const char *ipv6, bool on);
 
 #endif /* THREAD_HANDLER_H */

@@ -26,6 +26,9 @@
 
 #include "model_handler.h"
 #include "data_handler.h"
+#include "ble_nus.h"
+#include "mesh_ctrl.h"
+#include "data_handler.h"
 
 LOG_MODULE_REGISTER(model_handler, LOG_LEVEL_INF);
 
@@ -43,6 +46,8 @@ extern void mesh_scheduler_start(void);
 #define PROP_TVOC        0x0102
 #define PROP_RAW_RED     0x0103
 #define PROP_RAW_IR      0x0104
+#define PROP_SWITCH      0x0105
+#define PROP_LIGHT_STATE 0x0106
 #define PROP_SENSOR_SEQ  0x07FF
 
 /* ── Network Credentials ────────────────────────────────────── */
@@ -195,6 +200,10 @@ static void process_sensor_status(const uint8_t *data, uint16_t len, uint16_t sr
             p.raw_ir = read_le_unsigned(val, data_len);
             p.present |= SENSOR_HAS_RAW_IR;
             break;
+        case PROP_SWITCH:
+            p.switch_state = (uint8_t)read_le_unsigned(val, data_len);
+            if (p.switch_state)                p.present |= SENSOR_HAS_SWITCH;
+            break;
         default:
             LOG_WRN("Unknown Property 0x%04X (%u bytes)", prop_id, data_len);
         }
@@ -233,6 +242,34 @@ static const struct bt_mesh_model_op sensor_cli_ops[] = {
     {BT_MESH_MODEL_OP_SENSOR_STATUS, 0, sensor_status_handler},
     BT_MESH_MODEL_OP_END,
 };
+
+/* ── Generic OnOff Client ────────────────────────────────────── */
+/* Status handler — called when a lamp sends its OnOff state back.
+ * We forward to mesh_ctrl so it can update its state cache. */
+static int onoff_status_handler(const struct bt_mesh_model *model,
+                                 struct bt_mesh_msg_ctx *ctx,
+                                 struct net_buf_simple *buf)
+{
+    uint8_t present = net_buf_simple_pull_u8(buf);
+    mesh_ctrl_on_status(ctx->addr, present);
+
+    // actualize local cache of actuator states in data handler (for rules engine)
+    uint8_t idx = data_handler_get_node_idx_by_mesh_addr(ctx->addr);
+    if (idx != 0xFF) {
+        node_actuator_state[idx].known    = true;
+        node_actuator_state[idx].light_on = (present != 0);
+        LOG_INF("Light state confirmed: node_idx=%d %s",
+                idx, present ? "ON" : "OFF");
+    }
+    return 0;
+}
+
+static const struct bt_mesh_model_op onoff_cli_ops[] = {
+    { BT_MESH_MODEL_OP_GEN_ONOFF_STATUS, BT_MESH_LEN_MIN(1), onoff_status_handler },
+    BT_MESH_MODEL_OP_END,
+};
+
+BT_MESH_MODEL_PUB_DEFINE(onoff_cli_pub, NULL, 4);
 
 /* ── Device UUID (from FICR) ─────────────────────────────────── */
 
@@ -356,7 +393,7 @@ static void configure_node_handler(struct k_work *work)
                                       app_key, &status);
     if (err == -ETIMEDOUT) {
         LOG_WRN("  AppKey add timed out (RPL block?) — assuming success");
-    } else if (err || status) {
+    } else if (err && err != -EALREADY) {
         LOG_ERR("  AppKey add failed: err=%d status=0x%02X", err, status);
         schedule_node_retry();
         return;
@@ -376,6 +413,17 @@ static void configure_node_handler(struct k_work *work)
         return;
     } else {
         LOG_INF("  Bound to Sensor Server");
+    }
+
+    /* Bind Generic OnOff Server (falls vorhanden) */
+    err = bt_mesh_cfg_cli_mod_app_bind(NET_IDX, addr, addr,
+                                        APP_IDX,
+                                        BT_MESH_MODEL_ID_GEN_ONOFF_SRV,
+                                        &status);
+    if (err && err != -ETIMEDOUT) {
+        LOG_WRN("OnOff bind failed: %d", err);
+    } else {
+        LOG_INF("Generic OnOff Server bound");
     }
 
     /* 3. Set publication to group address */
@@ -485,6 +533,15 @@ static void unprovisioned_beacon_cb(uint8_t uuid[16],
 
     LOG_INF("ESP32 node detected: %02X%02X%02X%02X-%02X%02X...",
             uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5]);
+
+    if (ble_nus_is_ready()) {
+        char buf[80];
+        snprintf(buf, sizeof(buf),
+                 "{\"type\":\"beacon\",\"uuid\":\"%02x%02x%02x%02x%02x%02x%02x%02x\"}\n",
+                 uuid[0], uuid[1], uuid[2], uuid[3],
+                 uuid[4], uuid[5], uuid[6], uuid[7]);
+        ble_nus_send(buf);
+    }        
 
     init_next_node_addr();
     dump_cdb_nodes();
@@ -636,6 +693,9 @@ static struct bt_mesh_model root_models[] = {
     BT_MESH_MODEL_CFG_CLI(&cfg_cli),
     BT_MESH_MODEL_HEALTH_SRV(&health_srv, &health_pub),
     BT_MESH_MODEL(SENSOR_CLI_MODEL_ID, sensor_cli_ops, NULL, NULL),
+    /* Generic OnOff Client — controls commercial BLE Mesh lamps */
+    BT_MESH_MODEL(MESH_CTRL_ONOFF_CLI_ID, onoff_cli_ops,
+                  &onoff_cli_pub, NULL),
 };
 
 static struct bt_mesh_elem elements[] = {
@@ -738,6 +798,7 @@ const struct bt_mesh_comp *model_handler_comp_init(void)
     k_work_init_delayable(&prov_timeout_work, prov_timeout_handler);
     k_work_init_delayable(&prov_start_work, prov_start_handler);
     k_work_init_delayable(&unprovision_work, unprovision_handler);
+    mesh_ctrl_init(&root_models[4]);
 
     return &comp;
 }

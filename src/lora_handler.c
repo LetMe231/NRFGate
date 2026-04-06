@@ -87,13 +87,13 @@ int lora_handler_init(void)
 }
 
 
-void lora_handler_send(const char *json, uint8_t json_len)
+void lora_handler_send(const uint8_t *data, uint8_t len)
 {
-    if(!lora_dev || json_len == 0) return;
-    int err = lora_send(lora_dev, (uint8_t *)json, json_len);
+    if(!lora_dev || len == 0) return;
+    int err = lora_send(lora_dev, (uint8_t *)data, len);
     if (err) {
         LOG_WRN("LoRa send failed: %d", err);
     } else {
-        LOG_INF("LoRa sent");
+        LOG_INF("LoRa sent %d bytes", len);
     }
 }

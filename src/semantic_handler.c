@@ -1,12 +1,18 @@
+/**
+ * @file semantic_handler.c
+ * @brief Per-node semantic state machine.
+ */
+
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <string.h>
+#include <inttypes.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "semantic_handler.h"
-#include "data_handler.h"
 #include "main.h"
 #include "ble_nus.h"
+#include "rule_engine.h"
 
 LOG_MODULE_REGISTER(semantic_handler, LOG_LEVEL_INF);
 
@@ -63,16 +69,21 @@ static const char *state_str(node_state_t s){
     }
 }
 
-static void transition(semantic_node_t *n, uint8_t idx, node_state_t new_state, const struct node_sensor_data *d){
-    if(n->state == new_state) return;
-    
+static void transition(semantic_node_t *n, uint8_t idx,
+                       node_state_t new_state, const struct node_sensor_data *d)
+{
+    if (n->state == new_state) return;
+
     LOG_INF("[Node %d] %s -> %s", idx, state_str(n->state), state_str(new_state));
     n->state = new_state;
-    if(new_state == NODE_STATE_ALERT || new_state == NODE_STATE_CRITICAL){
+
+    if (new_state == NODE_STATE_ALERT || new_state == NODE_STATE_CRITICAL) {
         n->alert_since_ms = k_uptime_get();
-        if(d==NULL) return;
-        mesh_scheduler_request_priority(d->identity.transport, 10000);
+        if (d) mesh_scheduler_request_priority(d->identity.transport, 10000);
     }
+
+    node_transport_t transport = (d != NULL) ? d->identity.transport : NODE_TRANSPORT_THREAD; // default to Thread if no data
+    rule_engine_on_state(idx, new_state, transport);
 }
 
 static bool co2_rising_fast(semantic_node_t *n, int32_t current, int64_t now_ms){
@@ -143,7 +154,21 @@ static node_state_t evaluate_env(semantic_node_t *n, const struct sensor_payload
         }
         n->last_temp = p->temp;
     }
+
+
+    // PM2.5: >25 µg/m³ = ACTIVE, >75 = ALERT
+    // in evaluate_env():
+    if (p->present & SENSOR_HAS_PM25) {
+        if (p->pm25 >= 75)      worst = MAX(worst, NODE_STATE_ALERT);
+        else if (p->pm25 >= 25) worst = MAX(worst, NODE_STATE_ACTIVE);
+    }
+    if (p->present & SENSOR_HAS_PM10) {
+        if (p->pm10 >= 150)     worst = MAX(worst, NODE_STATE_ALERT);
+        else if (p->pm10 >= 50) worst = MAX(worst, NODE_STATE_ACTIVE);
+    }
     return worst;
+
+
 }
 
 static node_state_t evaluate_imu(semantic_node_t *n,

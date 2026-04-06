@@ -21,9 +21,9 @@
 #include "model_handler.h"
 #include "ble_nus.h"
 #include "lora_handler.h"
-#include "model_handler.h"
 #include "main.h"
 #include "semantic_handler.h"
+#include "rule_engine.h"
 
 LOG_MODULE_REGISTER(data_handler, LOG_LEVEL_INF);
 
@@ -36,6 +36,19 @@ typedef struct{
 
 static node_entry_t node_table[MAX_NODES];
 static uint8_t      node_count = 0;
+
+node_actuator_state_t node_actuator_state[MAX_NODES] = {0};
+
+uint8_t data_handler_get_node_idx_by_mesh_addr(uint16_t mesh_addr)
+{
+    for (uint8_t i = 0; i < node_count; i++) {
+        if (node_table[i].identity.transport == NODE_TRANSPORT_BLE_MESH &&
+            node_table[i].identity.mesh_addr == mesh_addr) {
+            return i;
+        }
+    }
+    return 0xFF;
+}
 
 atomic_t lora_enabled = ATOMIC_INIT(0); // LoRa forwarding is disabled by default, enabled via BLE cmd
 K_SEM_DEFINE(lora_wake_sem, 0, 1);
@@ -161,6 +174,15 @@ static void log_sensor_data(const struct node_sensor_data *d){
     if (p->present & SENSOR_HAS_RAW_IR) {
         LOG_INF("  IR     %d", p->raw_ir);
     }
+    if (p->present & SENSOR_HAS_PM25) {
+    LOG_INF("  PM2.5: %d µg/m³", p->pm25);
+    }
+    if (p->present & SENSOR_HAS_PM10) {
+        LOG_INF("  PM10:  %d µg/m³", p->pm10);
+    }
+    if(p->present & SENSOR_HAS_SWITCH){
+        LOG_INF("  Switch: %s", p->switch_state ? "PRESSED" : "IDLE");
+    }
 }
 
 
@@ -191,70 +213,89 @@ static int build_json(const struct node_sensor_data *d,
     const struct sensor_payload *p = &d->payload;
     int off = 0;
 
+        int rem;
+ 
+    #define JSON_APPEND(...) do {                                    \
+        rem = (int)size - off;                                       \
+        if (rem <= 0) { goto overflow; }                             \
+        off += snprintf(buf + off, (size_t)rem, __VA_ARGS__);        \
+    } while (0)
+    
     // Header: node index + transport tag
     const char *tr_tag = (d->identity.transport == NODE_TRANSPORT_BLE_MESH) ? "B" : "T";
     const char *state = semantic_handler_state_str(semantic_handler_get_state(d->node_idx));
-    off += snprintf(buf + off, size - off, "{\"node\":%d,\"tr\":\"%s\",\"state\":\"%s\"", d->node_idx, tr_tag, state);
-    if(p->present & SENSOR_HAS_SEQ){
-        off += snprintf(buf + off, size - off, ",\"seq\":%d", p->seq);
+    JSON_APPEND("{\"node\":%d,\"tr\":\"%s\",\"state\":\"%s\"", d->node_idx, tr_tag, state);
+    if (p->present & SENSOR_HAS_SEQ) {
+        JSON_APPEND(",\"seq\":%d", p->seq);
     }
-
     if (d->identity.transport == NODE_TRANSPORT_BLE_MESH) {
-        off += snprintf(buf + off, size - off,
-                        ",\"mesh_addr\":%d", d->identity.mesh_addr);
+        JSON_APPEND(",\"mesh_addr\":%d", d->identity.mesh_addr);
     }
-
-    // IMU — only for Thread/IMU nodes 
+ 
+    // IMU — only for Thread/IMU nodes
     if ((p->present & SENSOR_HAS_ACCEL) == SENSOR_HAS_ACCEL) {
-        off += snprintf(buf + off, size - off,
-                        ",\"ax\":%d.%03d,\"ay\":%d.%03d,\"az\":%d.%03d",
-                        p->ax / 1000, abs(p->ax % 1000),
-                        p->ay / 1000, abs(p->ay % 1000),
-                        p->az / 1000, abs(p->az % 1000));
+        JSON_APPEND(",\"ax\":%d.%03d,\"ay\":%d.%03d,\"az\":%d.%03d",
+                    p->ax / 1000, abs(p->ax % 1000),
+                    p->ay / 1000, abs(p->ay % 1000),
+                    p->az / 1000, abs(p->az % 1000));
     }
     if ((p->present & SENSOR_HAS_GYRO) == SENSOR_HAS_GYRO) {
-        off += snprintf(buf + off, size - off,
-                        ",\"gx\":%d.%03d,\"gy\":%d.%03d,\"gz\":%d.%03d",
-                        p->gx / 1000, abs(p->gx % 1000),
-                        p->gy / 1000, abs(p->gy % 1000),
-                        p->gz / 1000, abs(p->gz % 1000));
+        JSON_APPEND(",\"gx\":%d.%03d,\"gy\":%d.%03d,\"gz\":%d.%03d",
+                    p->gx / 1000, abs(p->gx % 1000),
+                    p->gy / 1000, abs(p->gy % 1000),
+                    p->gz / 1000, abs(p->gz % 1000));
     }
  
     // Environmental — shared
     if (p->present & SENSOR_HAS_TEMP) {
-        off += snprintf(buf + off, size - off, ",\"temp\":%d.%01d",
-                        p->temp / 1000, abs((p->temp % 1000) / 100));
+        JSON_APPEND(",\"temp\":%d.%01d",
+                    p->temp / 1000, abs((p->temp % 1000) / 100));
     }
     if (p->present & SENSOR_HAS_HUM) {
-        off += snprintf(buf + off, size - off, ",\"hum\":%d.%01d",
-                        p->hum / 1000, abs((p->hum % 1000) / 100));
+        JSON_APPEND(",\"hum\":%d.%01d",
+                    p->hum / 1000, abs((p->hum % 1000) / 100));
     }
  
-    // Air quality — shared 
+    // Air quality — shared
     if (p->present & SENSOR_HAS_TVOC) {
-        off += snprintf(buf + off, size - off, ",\"tvoc\":%d", p->tvoc);
+        JSON_APPEND(",\"tvoc\":%d", p->tvoc);
     }
     if (p->present & SENSOR_HAS_ECO2) {
-        off += snprintf(buf + off, size - off, ",\"eco2\":%d", p->eco2);
+        JSON_APPEND(",\"eco2\":%d", p->eco2);
     }
  
-    // Biometric — BLE Mesh only 
+    // Biometric — BLE Mesh only
     if (p->present & SENSOR_HAS_HEART_RATE) {
-        off += snprintf(buf + off, size - off, ",\"hr\":%d", p->heart_rate);
+        JSON_APPEND(",\"hr\":%d", p->heart_rate);
     }
     if (p->present & SENSOR_HAS_SPO2) {
-        off += snprintf(buf + off, size - off, ",\"spo2\":%d.%01d",
-                        p->spo2 / 1000, abs((p->spo2 % 1000) / 100));
+        JSON_APPEND(",\"spo2\":%d.%01d",
+                    p->spo2 / 1000, abs((p->spo2 % 1000) / 100));
     }
- 
-    // Close + newline (BLE NUS convention from original code) 
-    off += snprintf(buf + off, size - off, "}\n");
- 
-    if (off >= (int)size) {
-        LOG_ERR("JSON buffer overflow (%d >= %d)", off, (int)size);
-        return 0;
+    if (d->identity.transport == NODE_TRANSPORT_THREAD) {
+        JSON_APPEND(",\"ipv6\":\"%s\"", d->identity.ipv6);
     }
+    if (p->present & SENSOR_HAS_PM25) { JSON_APPEND(",\"pm25\":%d", p->pm25); }
+    if (p->present & SENSOR_HAS_PM10) { JSON_APPEND(",\"pm10\":%d", p->pm10); }
+    if (p->present & SENSOR_HAS_SWITCH && p->switch_state) {
+        JSON_APPEND(",\"sw\":%d", p->switch_state);
+    }
+    /* Aktuator-Status: vom Gateway gecacht, nicht vom Node gemeldet */
+    if (node_actuator_state[d->node_idx].known) {
+        JSON_APPEND(",\"light\":%d",
+                    node_actuator_state[d->node_idx].light_on ? 1 : 0);
+    }
+    // Close + newline
+    JSON_APPEND("}\n");
+ 
+#undef JSON_APPEND
+ 
     return off;
+ 
+overflow:
+    LOG_ERR("JSON buffer overflow at off=%d size=%d", off, (int)size);
+    return 0;
+   
 };
 
 // TLV serializer for LoRa binary forwarding
@@ -278,6 +319,10 @@ static int build_json(const struct node_sensor_data *d,
  *   22      2     eco2 [uint16_t, ppm]
  *   24      1     heart_rate [uint8_t, bpm]
  *   25      2     spo2 [uint16_t, m% / 10 → 0.1% resolution]
+ *   27      2     pm25 [uint16_t, µg/m³]
+ *   29      2     pm10 [uint16_t, µg/m³]
+ *   30      1     switch_state [uint8_t, 0=off, 1=on]
+ *   ──────────────────────────────────────────────────────────────
 */
 #define WIRE_MAX_SIZE 48   /* comfortably above worst-case 36 bytes */
  
@@ -336,6 +381,11 @@ static int build_wire(const struct node_sensor_data *d,
         buf[off++] = (uint8_t)p->heart_rate;   /* 1 byte, 0–255 bpm */
     }
     if (p->present & SENSOR_HAS_SPO2) { WRITE_U16(buf, off, p->spo2 / 10); }
+    if (p->present & SENSOR_HAS_PM25) { WRITE_U16(buf, off, p->pm25); }
+    if (p->present & SENSOR_HAS_PM10) { WRITE_U16(buf, off, p->pm10); }
+    if (p->present & SENSOR_HAS_SWITCH) {
+        buf[off++] = p->switch_state; /* 1 byte, 0=off, 1=on */
+    }
  
     return off;
 }
@@ -444,6 +494,10 @@ void data_handler_receive(const struct node_sensor_data *data){
 
     semantic_handler_process(&d);
 
+    if (d.payload.present & SENSOR_HAS_SWITCH) {
+        rule_engine_on_switch(d.node_idx, d.payload.switch_state != 0, d.identity.transport);
+    }
+    
     if(ble_nus_is_ready()){
         forward_ble_nus(&d);
     }
@@ -512,67 +566,94 @@ void data_handler_cmd(const char *cmd, uint16_t len)
         model_handler_unprovision_node(mesh_addr);
         return;
     }
-    /* ── lora_enabled ────────────────────────────────────────────*/
-    const char *p = strstr(cmd, "\"lora_enabled\"");
-    if (!p) { LOG_WRN("Unknown command: %.*s", len, cmd); return; }
- 
-    p = strchr(p, ':');
-    if (!p) { LOG_WRN("Malformed lora_enabled command"); return; }
-    while (*++p == ' ' || *p == '\t') {}
- 
-    if (strncmp(p, "true", 4) == 0) {
-        atomic_set(&lora_enabled, 1);
-        k_sem_give(&lora_wake_sem);
-        LOG_INF("LoRa enabled");
-    } else if (strncmp(p, "false", 5) == 0) {
-        atomic_set(&lora_enabled, 0);
-        LOG_INF("LoRa disabled");
-    }
+   /* ── add_rule ────────────────────────────────────────────────*/
+    if (strstr(cmd, "\"add_rule\"")) {
+        gateway_rule_t rule = {0};
 
-    /* ── set policy ───────────────────────────────────────
-         * {"cmd":"set_policy","motion_thr":2.0,"alert_thr":15.0,"co2_thr":1000,...}
-     */
-    if (strstr(cmd, "\"set_policy\"")) {
-        int32_t motion_active = -1, motion_alert = -1, co2_alert = -1;
-        int32_t temp_alert = -1, tvoc_alert = -1;
-        int32_t thread_ms = -1, ble_ms = -1;
- 
-        const char *p;
- 
-        p = strstr(cmd, "\"motion_thr\"");
-        if (p) { p = strchr(p, ':'); if (p) motion_active = (int32_t)(atof(p+1) * 100); }
- 
-        p = strstr(cmd, "\"alert_thr\"");
-        if (p) { p = strchr(p, ':'); if (p) motion_alert = (int32_t)(atof(p+1) * 100); }
- 
-        p = strstr(cmd, "\"co2_thr\"");
-        if (p) { p = strchr(p, ':'); if (p) co2_alert = (int32_t)atoi(p+1); }
- 
-        p = strstr(cmd, "\"temp_alert\"");
-        if (p) { p = strchr(p, ':'); if (p) temp_alert = (int32_t)(atof(p+1) * 1000); }
- 
-        p = strstr(cmd, "\"tvoc_alert\"");
-        if (p) { p = strchr(p, ':'); if (p) tvoc_alert = (int32_t)atoi(p+1); }
- 
-        p = strstr(cmd, "\"thread_ms\"");
-        if (p) { p = strchr(p, ':'); if (p) thread_ms = (int32_t)atoi(p+1); }
- 
-        p = strstr(cmd, "\"ble_ms\"");
-        if (p) { p = strchr(p, ':'); if (p) ble_ms = (int32_t)atoi(p+1); }
+        const char *f;
+        f = strstr(cmd, "\"src\"");
+        if (!f) { LOG_WRN("add_rule: missing src"); return; }
+        f = strchr(f, ':'); if (!f) { LOG_WRN("add_rule: malformed src"); return; }
+        rule.src_node_idx = (uint8_t)atoi(f + 1);
 
-        p = strstr(cmd, "\"idle_interval\"");
-        if (p) { p = strchr(p, ':'); if (p) node_lost_timeout_ms = (int32_t)atoi(p+1)*1000; }
- 
-        semantic_handler_set_policy(motion_active, motion_alert, co2_alert,
-                                    temp_alert, tvoc_alert);
- 
-        if (thread_ms > 0 || ble_ms > 0) {
-            mesh_scheduler_set_timing(
-                thread_ms > 0 ? (uint32_t)thread_ms : sched_thread_ms,
-                ble_ms    > 0 ? (uint32_t)ble_ms    : sched_ble_ms);
+        f = strstr(cmd, "\"trig\"");
+        if (!f) { LOG_WRN("add_rule: missing trig"); return; }
+        f = strchr(f, ':'); if (!f) { LOG_WRN("add_rule: malformed trig"); return; }
+        rule.trigger = (rule_trigger_t)atoi(f + 1);
+
+        f = strstr(cmd, "\"act\"");
+        if (!f) { LOG_WRN("add_rule: missing act"); return; }
+        f = strchr(f, ':'); if (!f) { LOG_WRN("add_rule: malformed act"); return; }
+        rule.action = (rule_action_t)atoi(f + 1);
+
+        f = strstr(cmd, "\"type\"");
+        if (!f) { LOG_WRN("add_rule: missing type"); return; }
+        f = strchr(f, ':'); if (!f) { LOG_WRN("add_rule: malformed type"); return; }
+        while (*++f == ' ' || *f == '"') {}
+        rule.target_is_thread = (strncmp(f, "thread", 6) == 0);
+
+        f = strstr(cmd, "\"target\"");
+        if (!f) { LOG_WRN("add_rule: missing target"); return; }
+        f = strchr(f, ':'); if (!f) { LOG_WRN("add_rule: malformed target"); return; }
+        while (*++f == ' ') {}
+        if (*f == '"') {
+            /* Thread: IPv6 string */
+            f++;
+            size_t n = 0;
+            while (f[n] && f[n] != '"' && n < sizeof(rule.target.ipv6) - 1) n++;
+            memcpy(rule.target.ipv6, f, n);
+            rule.target.ipv6[n] = '\0';
+        } else {
+            /* BLE Mesh: integer address */
+            rule.target.mesh_addr = (uint16_t)atoi(f);
         }
- 
-        LOG_INF("Policy applied");
+
+        int idx = rule_engine_add(&rule);
+        if (idx >= 0) {
+            LOG_INF("add_rule OK → slot %d", idx);
+        }
         return;
     }
+
+    /* ── list_rules ──────────────────────────────────────────────*/
+    if (strstr(cmd, "\"list_rules\"")) {
+        char buf[512];
+        rule_engine_to_json(buf, sizeof(buf));
+        ble_nus_send(buf);
+        return;
+    }
+
+    /* ── remove_rule ─────────────────────────────────────────────*/
+    if (strstr(cmd, "\"remove_rule\"")) {
+        const char *f = strstr(cmd, "\"idx\"");
+        if (!f) { LOG_WRN("remove_rule: missing idx"); return; }
+        f = strchr(f, ':'); if (!f) { LOG_WRN("remove_rule: malformed"); return; }
+        rule_engine_remove((uint8_t)atoi(f + 1));
+        /* Sofort aktualisierte Liste zurückschicken */
+        char buf[512];
+        rule_engine_to_json(buf, sizeof(buf));
+        ble_nus_send(buf);
+        return;
+    }
+    /* ── lora_enabled ────────────────────────────────────────────*/
+    {
+        const char *p = strstr(cmd, "\"lora_enabled\"");
+        if (!p) { LOG_WRN("Unknown command: %.*s", len, cmd); return; }  /* ← return war hier weg */
+
+        p = strchr(p, ':');
+        if (!p) { LOG_WRN("Malformed lora_enabled command"); return; }
+        while (*++p == ' ' || *p == '\t') {}
+
+        if (strncmp(p, "true", 4) == 0) {
+            atomic_set(&lora_enabled, 1);
+            k_sem_give(&lora_wake_sem);
+            LOG_INF("LoRa enabled");
+        } else if (strncmp(p, "false", 5) == 0) {
+            atomic_set(&lora_enabled, 0);
+            LOG_INF("LoRa disabled");
+        }
+        return;
+    }
+
+     LOG_WRN("Unknown command: %.*s", len, cmd);
 }

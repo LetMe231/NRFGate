@@ -23,6 +23,7 @@
 #include <openthread/thread.h>
 
 #include "thread_handler.h"
+#include "main.h"
 #include "data_handler.h"
 
 LOG_MODULE_REGISTER(thread_handler, LOG_LEVEL_INF);
@@ -55,6 +56,10 @@ struct sensor_json {
     int32_t heart_rate, spo2;
     int32_t raw_red, raw_ir;
 
+    int32_t pm25, pm10;   // µg/m3
+
+    int32_t sw;          // generic switch input state (0=off, 1=on)
+    int32_t light;       // generic light state (0=off, 1=on)
     // add more sensor data here
 };
 
@@ -75,7 +80,10 @@ static const struct json_obj_descr sensor_descr[] = {
     JSON_OBJ_DESCR_PRIM(struct sensor_json, spo2, JSON_TOK_NUMBER),
     JSON_OBJ_DESCR_PRIM(struct sensor_json, raw_red, JSON_TOK_NUMBER),
     JSON_OBJ_DESCR_PRIM(struct sensor_json, raw_ir, JSON_TOK_NUMBER),
-
+    JSON_OBJ_DESCR_PRIM(struct sensor_json, pm25, JSON_TOK_NUMBER),
+    JSON_OBJ_DESCR_PRIM(struct sensor_json, pm10, JSON_TOK_NUMBER),
+    JSON_OBJ_DESCR_PRIM(struct sensor_json, sw, JSON_TOK_NUMBER),
+    JSON_OBJ_DESCR_PRIM(struct sensor_json, light, JSON_TOK_NUMBER),
 };
 
 /* ── POST /sensors Handler ───────────────────────────────────── */
@@ -86,14 +94,17 @@ static int sensors_post(struct coap_resource *resource,
 {
     ARG_UNUSED(resource);
 
+    uint8_t token[COAP_TOKEN_MAX_LEN];
+    uint8_t token_len = coap_header_get_token(request, token);
+
     // Ack the request immediately to free up the sender, then do processing and forwarding asynchronously
-    uint8_t ack_buf[4];
+    uint8_t ack_buf[16];
     struct coap_packet ack;
 
     coap_packet_init(&ack, ack_buf, sizeof(ack_buf),
                     COAP_VERSION_1,
                     COAP_TYPE_ACK,
-                    0, NULL,
+                    token_len, token,                // echo the token back to correlate with request
                     COAP_RESPONSE_CODE_CHANGED,      // 2.04
                     coap_header_get_id(request));    // same Message-ID as request
 
@@ -111,6 +122,16 @@ static int sensors_post(struct coap_resource *resource,
         LOG_WRN("No payload in CoAP request from %s", id.ipv6);
         return -EINVAL;
     }
+
+    // Ignore discovery packets
+    if (payload_len >= 0){
+        const char *pl = (const char *)payload;
+        if (memchr(pl, 'd', payload_len) && strncmp(pl, "{\"discover\"", MIN(payload_len, 11)) == 0){
+            LOG_INF("Ignoring discovery packet from %s", id.ipv6);
+            return 0;
+        }
+    }
+
 
     // Parse JSON payload into sensor struct
     struct sensor_json s = {0};
@@ -136,11 +157,21 @@ static int sensors_post(struct coap_resource *resource,
             .tvoc = s.tvoc, .eco2 = s.eco2,
             .heart_rate = s.heart_rate, .spo2 = s.spo2,
             .raw_red = s.raw_red, .raw_ir = s.raw_ir,
+            .pm25 = s.pm25, .pm10 = s.pm10,
+            .switch_state = s.sw,
         },
         .rx_uptime_ms = k_uptime_get(),
     };
 
     data_handler_receive(&nd);
+
+    if (present & SENSOR_HAS_LIGHT) {
+        uint8_t idx = nd.node_idx;
+        if (idx < MAX_NODES) {
+            node_actuator_state[idx].known    = true;
+            node_actuator_state[idx].light_on = (s.light != 0);
+        } 
+    }
     return 0;
 }
 
@@ -176,6 +207,11 @@ static void coap_rx_thread(void *p1, void *p2, void *p3)
 
     /* Wait for OpenThread interface to come up */
     struct net_if *iface = net_if_get_default();
+
+    if (!iface) {
+        LOG_ERR("No network interface found");
+        return;
+    }
 
     while (!net_if_is_up(iface)) {
         LOG_INF("Waiting for network interface...");
@@ -279,5 +315,79 @@ int thread_handler_init(void)
                     PRIORITY, 0, K_NO_WAIT);
 
     LOG_INF("CoAP RX thread started on port %d", COAP_PORT);
+    return 0;
+}
+// Coap put/light
+int thread_handler_coap_put_light(const char *ipv6, bool on)
+{
+    /* Build CoAP packet */
+    static uint8_t pkt_buf[128];
+    static uint16_t msg_id = 1;
+    struct coap_packet pkt;
+
+    int r = coap_packet_init(&pkt, pkt_buf, sizeof(pkt_buf),
+                              COAP_VERSION_1,
+                              COAP_TYPE_NON_CON,
+                              COAP_TOKEN_MAX_LEN,
+                              coap_next_token(),
+                              COAP_METHOD_PUT,
+                              msg_id++);
+    if (r < 0) {
+        LOG_ERR("coap_packet_init: %d", r);
+        return r;
+    }
+
+    /* URI path: /light */
+    r = coap_packet_append_option(&pkt, COAP_OPTION_URI_PATH,
+                                  "light", strlen("light"));
+    if (r < 0) { LOG_ERR("URI path: %d", r); return r; }
+
+    /* Content-Format: application/json */
+    uint8_t fmt = COAP_CONTENT_FORMAT_APP_JSON;
+    r = coap_packet_append_option(&pkt, COAP_OPTION_CONTENT_FORMAT,
+                                  &fmt, sizeof(fmt));
+    if (r < 0) { LOG_ERR("Content-Format: %d", r); return r; }
+
+    /* Payload */
+    r = coap_packet_append_payload_marker(&pkt);
+    if (r < 0) { LOG_ERR("Payload marker: %d", r); return r; }
+
+    const char *body = on ? "{\"on\":true}" : "{\"on\":false}";
+    r = coap_packet_append_payload(&pkt, (uint8_t *)body, strlen(body));
+    if (r < 0) { LOG_ERR("Payload: %d", r); return r; }
+
+    /* Open ephemeral socket */
+    int tx_sock = zsock_socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    if (tx_sock < 0) {
+        LOG_ERR("TX socket: %d", errno);
+        return -errno;
+    }
+
+    /* Destination address */
+    struct sockaddr_in6 dst = {
+        .sin6_family = AF_INET6,
+        .sin6_port   = htons(COAP_PORT),
+    };
+    r = net_addr_pton(AF_INET6, ipv6, &dst.sin6_addr);
+    if (r < 0) {
+        LOG_ERR("Invalid IPv6: %s", ipv6);
+        zsock_close(tx_sock);
+        return r;
+    }
+
+    /* Send */
+    mesh_scheduler_request_priority(SCHED_PRIORITY_THREAD, 2000);
+    k_msleep(300);  /* warten bis Thread-Fenster aktiv */
+    r = zsock_sendto(tx_sock, pkt.data, pkt.offset, 0,
+                     (struct sockaddr *)&dst, sizeof(dst));
+    zsock_close(tx_sock);
+
+    if (r < 0) {
+        LOG_ERR("sendto %s: %d", ipv6, errno);
+        return -errno;
+    }
+
+    LOG_INF("CoAP PUT /light → [%s] %s (%d bytes)",
+            ipv6, on ? "ON" : "OFF", r);
     return 0;
 }

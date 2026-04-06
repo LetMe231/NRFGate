@@ -59,6 +59,10 @@ typedef struct{
 #define SENSOR_HAS_SPO2         BIT(13)
 #define SENSOR_HAS_RAW_RED      BIT(14)
 #define SENSOR_HAS_RAW_IR       BIT(15)
+#define SENSOR_HAS_PM25         BIT(16)
+#define SENSOR_HAS_PM10         BIT(17)
+#define SENSOR_HAS_SWITCH       BIT(18)
+#define SENSOR_HAS_LIGHT        BIT(19)
 // new nodes here 
 
 // sensor groups for convenience
@@ -87,6 +91,9 @@ struct sensor_payload {
     int32_t heart_rate, spo2;
     int32_t raw_red, raw_ir;
 
+    uint8_t switch_state;   // 0=off, 1=on, for a generic switch input
+
+    int32_t pm25, pm10;
     // add more sensor fields here
 };
 
@@ -96,6 +103,17 @@ struct node_sensor_data {
     int64_t rx_uptime_ms;               // k_uptime_get() at reception time, set by thread_handler    
     struct sensor_payload payload;
 };
+
+//===============================================================
+// Actuator command struct
+//===============================================================
+
+typedef struct {
+    bool known;
+    bool light_on;
+} node_actuator_state_t;
+
+extern node_actuator_state_t node_actuator_state[MAX_NODES];
 
 //===============================================
 // Public API

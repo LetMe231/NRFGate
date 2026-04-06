@@ -10,6 +10,8 @@ target_sources(app PRIVATE
     src/ble_nus.c
     src/lora_handler.c
     src/data_handler.c
-    src/semantic_handler.c)
+    src/semantic_handler.c
+    src/mesh_ctrl.c
+    src/rule_engine.c)
 
 target_include_directories(app PRIVATE inc)
