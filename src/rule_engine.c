@@ -201,6 +201,7 @@ const gateway_rule_t *rule_engine_get(uint8_t idx)
 
 int rule_engine_to_json(char *buf, size_t size)
 {
+    if(!buf || size <= 16) return 0;
     int off = 0;
     off += snprintf(buf + off, size - off, "{\"rules\":[");
 
@@ -208,8 +209,13 @@ int rule_engine_to_json(char *buf, size_t size)
     for (int i = 0; i < RULE_MAX; i++) {
         if (!s_rules[i].active) continue;
         const gateway_rule_t *r = &s_rules[i];
+
+        if ((size_t)off >= size - 1) break; // check buffer overflow before writing
+
         if (!first) off += snprintf(buf + off, size - off, ",");
         first = false;
+        
+        if ((size_t)off >= size - 1) break; // check again before writing rule details
 
         if (r->target_is_thread) {
             off += snprintf(buf + off, size - off,
@@ -225,6 +231,9 @@ int rule_engine_to_json(char *buf, size_t size)
                 r->action, r->target.mesh_addr);
         }
     }
-    off += snprintf(buf + off, size - off, "]}\n");
+    // make sure we don't write beyond buffer size when adding closing brackets
+    if ((size_t)off < size - 3) {
+        off += snprintf(buf + off, size - off, "]}\n");
+    }
     return off;
 }

@@ -14,13 +14,13 @@
 // Public API
 /**
  * @brief Initialize the Mesh Control model with a pointer to the registered model.
- * Called from model_handler after bt_mesh_init().
+ * Called from ble_mesh_handler after bt_mesh_init().
  * @param model Pointer to the Bluetooth Mesh model structure.
  */
 void mesh_ctrl_init(const struct bt_mesh_model *model);
 
 /**
- * @brief Called by model_handler's onoff_status_handler
+ * @brief Called by ble_mesh_handler's onoff_status_handler
  * updates internal state cache.
  */
 void mesh_ctrl_on_status(uint16_t addr, uint8_t state);

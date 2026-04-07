@@ -8,6 +8,7 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h> 
 
 #include "semantic_handler.h"
 #include "main.h"
@@ -32,6 +33,7 @@ int32_t node_lost_timeout_ms = 30000;
 typedef struct{
     node_state_t state;
     int64_t last_rx_ms;
+    bool ever_seen; 
     int64_t alert_since_ms;
     bool lost_reported;
 
@@ -86,27 +88,28 @@ static void transition(semantic_node_t *n, uint8_t idx,
     rule_engine_on_state(idx, new_state, transport);
 }
 
-static bool co2_rising_fast(semantic_node_t *n, int32_t current, int64_t now_ms){
+static bool co2_rising_fast(semantic_node_t *n, int32_t current, int64_t now_ms)
+{
     uint8_t idx = n->co2_hist_idx;
-
-    // Store current reading in history
     n->co2_hist[idx].ts_ms = now_ms;
     n->co2_hist[idx].value = current;
     n->co2_hist_idx = (idx + 1) % ARRAY_SIZE(n->co2_hist);
 
-    // find oldest reading within trend window
-    for(uint8_t i=0; i<ARRAY_SIZE(n->co2_hist); i++){
-        if(n->co2_hist[i].ts_ms == 0) continue;
-        if(now_ms - n->co2_hist[i].ts_ms > TREND_WINDOW_MS) continue;
-        if(current - n->co2_hist[i].value >= TREND_CO2_RISE_PPM){
+    for (uint8_t i = 0; i < ARRAY_SIZE(n->co2_hist); i++) {
+        if (n->co2_hist[i].ts_ms == -1) continue;
+        if (n->co2_hist[i].ts_ms == now_ms) continue;
+        if (now_ms - n->co2_hist[i].ts_ms > TREND_WINDOW_MS) continue;
+        // NEU: Trend nur relevant wenn Ausgangswert schon erhöht war
+        if (n->co2_hist[i].value < thresh_co2_active) continue;
+        if (current - n->co2_hist[i].value >= TREND_CO2_RISE_PPM) {
             LOG_INF("  CO2 rising fast: %d ppm in %lld ms",
-                    current - n->co2_hist[i].value, now_ms - n->co2_hist[i].ts_ms);
+                    current - n->co2_hist[i].value,
+                    now_ms - n->co2_hist[i].ts_ms);
             return true;
         }
     }
     return false;
 }
-
 // pre-metric state evaluation
 
 static bool above_with_hyst(int32_t current, int32_t last, int32_t thresh, int32_t hyst){
@@ -134,6 +137,7 @@ static node_state_t evaluate_env(semantic_node_t *n, const struct sensor_payload
                                 thresh_co2_active, THRESH_CO2_HYST)) {
             worst = MAX(worst, NODE_STATE_ACTIVE);
         }
+        n->last_co2 = p->eco2;
     }
 
     // TVOC
@@ -217,6 +221,11 @@ static node_state_t apply_sustain(semantic_node_t *n, node_state_t candidate, in
 
 int semantic_handler_init(void){
     memset(node_states, 0, sizeof(node_states));
+     for (int i = 0; i < MAX_NODES; i++) {
+        for (int j = 0; j < ARRAY_SIZE(node_states[i].co2_hist); j++) {
+            node_states[i].co2_hist[j].ts_ms = -1;
+        }
+    }
     LOG_INF("Semantic handler initialized");
     return 0;
 }
@@ -232,6 +241,7 @@ void semantic_handler_process(const struct node_sensor_data *d){
     int64_t now_ms = d->rx_uptime_ms;
 
     n->last_rx_ms = now_ms;
+    n->ever_seen  = true;
     n->lost_reported = false;
 
     // first packet -> enter idle
@@ -257,7 +267,7 @@ void semantic_handler_tick(void){
     for(uint8_t i=0; i<MAX_NODES; i++){
         semantic_node_t *n = &node_states[i];
         if(n->state == NODE_STATE_UNKNOWN) continue;
-        if(n->last_rx_ms == 0) continue; // should not happen, but guard against uninitialized
+        if(!n->ever_seen) continue; // should not happen, but guard against uninitialized
 
         int64_t silence = now_ms - n->last_rx_ms;
         

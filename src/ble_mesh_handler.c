@@ -1,5 +1,5 @@
 /**
- * @file model_handler.c
+ * @file ble_mesh_handler.c
  * @brief BLE Mesh provisioner and sensor client
  *
  * Handles:
@@ -24,14 +24,15 @@
 #include <hal/nrf_ficr.h>
 #include <dk_buttons_and_leds.h>
 
-#include "model_handler.h"
+#include "ble_mesh_handler.h"
 #include "data_handler.h"
 #include "ble_nus.h"
 #include "mesh_ctrl.h"
 #include "data_handler.h"
 #include "semantic_handler.h"
+#include "mesh_parser.h"
 
-LOG_MODULE_REGISTER(model_handler, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(ble_mesh_handler, LOG_LEVEL_INF);
 
 static bool s_unprov_pending = false;       // True when device has been unprovisioned -> pending guard
 K_MUTEX_DEFINE(s_pending_mutex);
@@ -86,51 +87,6 @@ static const uint8_t app_key[16] = {
 static uint16_t unprov_target_addr;
 static struct k_work_delayable unprovision_work;
 
-/* ── MPID Parser (Format A) ─────────────────────────────────── */
-
-/**
- * Parse a Format A Marshalled Property ID (16-bit header).
- *
- * Layout:
- *   Bit 0      = format (0 = Format A)
- *   Bits 1–4   = length (zero-based, 0 = 1 byte)
- *   Bits 5–15  = Property ID (11 bits)
- */
-static bool parse_mpid_format_a(uint16_t mpid, uint16_t *prop_id,
-                                uint8_t *data_len)
-{
-    if (mpid & 0x01) {
-        return false;
-    }
-    *data_len = ((mpid >> 1) & 0x0F) + 1;
-    *prop_id  = (mpid >> 5) & 0x7FF;
-    return true;
-}
-
-/* ── Little-Endian Readers ───────────────────────────────────── */
-
-static int32_t read_le_signed(const uint8_t *data, uint8_t len)
-{
-    switch (len) {
-    case 1: return (int8_t)data[0];
-    case 2: return (int16_t)(data[0] | (data[1] << 8));
-    case 4: return (int32_t)(data[0] | (data[1] << 8) |
-                             (data[2] << 16) | (data[3] << 24));
-    default: return 0;
-    }
-}
-
-static uint32_t read_le_unsigned(const uint8_t *data, uint8_t len)
-{
-    switch (len) {
-    case 1: return data[0];
-    case 2: return data[0] | (data[1] << 8);
-    case 4: return data[0] | (data[1] << 8) |
-                   (data[2] << 16) | (data[3] << 24);
-    default: return 0;
-    }
-}
-
 /* ── Sensor Status Payload Parser ────────────────────────────── */
 
 static void process_sensor_status(const uint8_t *data, uint16_t len, uint16_t src_addr)
@@ -143,7 +99,7 @@ static void process_sensor_status(const uint8_t *data, uint16_t len, uint16_t sr
         uint16_t prop_id;
         uint8_t data_len;
 
-        if (!parse_mpid_format_a(mpid, &prop_id, &data_len)) {
+        if (!mesh_parse_mpid_format_a(mpid, &prop_id, &data_len)) {
             break;
         }
 
@@ -159,53 +115,53 @@ static void process_sensor_status(const uint8_t *data, uint16_t len, uint16_t sr
 
         switch (prop_id) {
         case PROP_SENSOR_SEQ:
-            p.seq = read_le_unsigned(val, data_len);
+            p.seq = mesh_read_le_signed(val, data_len);
             p.present |= SENSOR_HAS_SEQ;
             break;
         case PROP_TEMPERATURE: {
             // ble mesh: 0.01%RH steps, so multiply by 10 for 0.1°C steps
-            p.temp = read_le_signed(val, data_len) * 10;
+            p.temp = mesh_read_le_signed(val, data_len) * 10;
             p.present |= SENSOR_HAS_TEMP;
             break;
         }
         case PROP_HUMIDITY: {
             // ble mesh: 0.01%RH steps, so multiply by 10 for 0.1% steps
-            p.hum = (int32_t)read_le_unsigned(val, data_len) * 10;
+            p.hum = (int32_t)mesh_read_le_unsigned(val, data_len) * 10;
             p.present |= SENSOR_HAS_HUM;
             break;
         }
         case PROP_ECO2:
             // ppm no scaling
-            p.eco2 = read_le_unsigned(val, data_len);
+            p.eco2 = mesh_read_le_unsigned(val, data_len);
             p.present |= SENSOR_HAS_ECO2;
             break;
         case PROP_TVOC:
             // ppb no scaling
-            p.tvoc = read_le_unsigned(val, data_len);
+            p.tvoc = mesh_read_le_unsigned(val, data_len);
             p.present |= SENSOR_HAS_TVOC;
             break;
         case PROP_HEART_RATE:
             // bpm no scaling
-            p.heart_rate = read_le_unsigned(val, data_len);
+            p.heart_rate = mesh_read_le_unsigned(val, data_len);
             p.present |= SENSOR_HAS_HEART_RATE;
             break;
         case PROP_SPO2:
             // ble mesh: 0.01% steps, so multiply by 10 for 0.1% steps
-            p.spo2 = (int32_t)read_le_unsigned(val, data_len) * 10;
+            p.spo2 = (int32_t)mesh_read_le_unsigned(val, data_len) * 10;
             p.present |= SENSOR_HAS_SPO2;
             break;
         case PROP_RAW_RED:
             // raw sensor value, no scaling
-            p.raw_red = read_le_unsigned(val, data_len);
+            p.raw_red = mesh_read_le_unsigned(val, data_len);
             p.present |= SENSOR_HAS_RAW_RED;
             break;
         case PROP_RAW_IR:
             // raw sensor value, no scaling
-            p.raw_ir = read_le_unsigned(val, data_len);
+            p.raw_ir = mesh_read_le_unsigned(val, data_len);
             p.present |= SENSOR_HAS_RAW_IR;
             break;
         case PROP_SWITCH:
-            p.switch_state = (uint8_t)read_le_unsigned(val, data_len);
+            p.switch_state = (uint8_t)mesh_read_le_unsigned(val, data_len);
             if (p.switch_state)                p.present |= SENSOR_HAS_SWITCH;
             break;
         default:
@@ -584,7 +540,7 @@ static void unprovisioned_beacon_cb(uint8_t uuid[16],
     }
 }
 
-void model_handler_reconfigure_node(uint16_t mesh_addr)
+void ble_mesh_handler_reconfigure_node(uint16_t mesh_addr)
 {
     struct bt_mesh_cdb_node *node = bt_mesh_cdb_node_get(mesh_addr);
     if (!node) {
@@ -759,7 +715,7 @@ static const struct bt_mesh_prov prov = {
 
 /* ── Public API ──────────────────────────────────────────────── */
 
-const struct bt_mesh_prov *model_handler_prov_init(void)
+const struct bt_mesh_prov *ble_mesh_handler_prov_init(void)
 {
     int err = hwinfo_get_device_id(prov_uuid, sizeof(prov_uuid));
 
@@ -825,7 +781,7 @@ static void unprovision_handler(struct k_work *work)
 }
  
 
-const struct bt_mesh_comp *model_handler_comp_init(void)
+const struct bt_mesh_comp *ble_mesh_handler_comp_init(void)
 {
     k_work_queue_init(&config_wq);
     k_work_queue_start(&config_wq, config_wq_stack,
@@ -842,13 +798,13 @@ const struct bt_mesh_comp *model_handler_comp_init(void)
     return &comp;
 }
 
-void model_handler_self_provision(void)
+void ble_mesh_handler_self_provision(void)
 {
     self_provision();
 }
 
 
-void model_handler_start_provisioning(void)
+void ble_mesh_handler_start_provisioning(void)
 {
     if (prov_scanning) {
         LOG_INF("Provisioning window already open");
@@ -874,7 +830,7 @@ void model_handler_start_provisioning(void)
 
  
 
-void model_handler_unprovision_node(uint16_t mesh_addr)
+void ble_mesh_handler_unprovision_node(uint16_t mesh_addr)
 {
     if (s_unprov_pending) {
         LOG_WRN("Unprovision already in progress, ignoring 0x%04X", mesh_addr);

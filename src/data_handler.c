@@ -18,7 +18,7 @@
 #include <stdlib.h>
 
 #include "data_handler.h"
-#include "model_handler.h"
+#include "ble_mesh_handler.h"
 #include "ble_nus.h"
 #include "lora_handler.h"
 #include "main.h"
@@ -49,6 +49,20 @@ uint8_t data_handler_get_node_idx_by_mesh_addr(uint16_t mesh_addr)
             return i;
         }
     }
+    return 0xFF;
+}
+
+uint8_t data_handler_get_node_idx_by_ipv6(const char *ipv6)
+{
+    k_mutex_lock(&s_node_mutex, K_FOREVER);
+    for (uint8_t i = 0; i < node_count; i++) {
+        if (node_table[i].identity.transport == NODE_TRANSPORT_THREAD &&
+            strncmp(node_table[i].identity.ipv6, ipv6, NODE_ADDR_STR_LEN) == 0) {
+            k_mutex_unlock(&s_node_mutex);
+            return i;
+        }
+    }
+    k_mutex_unlock(&s_node_mutex);
     return 0xFF;
 }
 
@@ -307,100 +321,6 @@ overflow:
    
 };
 
-// TLV serializer for LoRa binary forwarding
-/* Frame layout (all fields present, worst case = 36 bytes):
- *
- *   Offset  Size  Field
- *   ──────  ────  ──────────────────────────────────────────────
- *   0       1     node_idx
- *   1       1     transport  (0 = Thread, 1 = BLE Mesh)
- *   2       2     present bitmask, little-endian
- *   ── then only the fields whose bit is set, in this order: ──
- *   4       2     ax  [int16_t, mg,     little-endian]
- *   6       2     ay
- *   8       2     az
- *   10      2     gx  [int16_t, mdeg/s, little-endian]
- *   12      2     gy
- *   14      2     gz
- *   16      2     temp [int16_t, m°C / 10 → 0.1°C resolution]
- *   18      2     hum  [int16_t, m%RH / 10]
- *   20      2     tvoc [uint16_t, ppb]
- *   22      2     eco2 [uint16_t, ppm]
- *   24      1     heart_rate [uint8_t, bpm]
- *   25      2     spo2 [uint16_t, m% / 10 → 0.1% resolution]
- *   27      2     pm25 [uint16_t, µg/m³]
- *   29      2     pm10 [uint16_t, µg/m³]
- *   30      1     switch_state [uint8_t, 0=off, 1=on]
- *   ──────────────────────────────────────────────────────────────
-*/
-#define WIRE_MAX_SIZE 48   /* comfortably above worst-case 36 bytes */
- 
-/* Helper macros — write little-endian without casting noise */
-#define WRITE_I16(buf, off, val) do { \
-    int16_t _v = (int16_t)(val);      \
-    (buf)[(off)++] = (uint8_t)(_v);   \
-    (buf)[(off)++] = (uint8_t)(_v >> 8); \
-} while (0)
- 
-#define WRITE_U16(buf, off, val) do { \
-    uint16_t _v = (uint16_t)(val);    \
-    (buf)[(off)++] = (uint8_t)(_v);   \
-    (buf)[(off)++] = (uint8_t)(_v >> 8); \
-} while (0)
- 
-static int build_wire(const struct node_sensor_data *d,
-                      uint8_t *buf, size_t size)
-{
-    if (size < WIRE_MAX_SIZE) {
-        LOG_ERR("Wire buffer too small (%d < %d)", (int)size, WIRE_MAX_SIZE);
-        return 0;
-    }
- 
-    const struct sensor_payload *p = &d->payload;
-    int off = 0;
- 
-    /* 4-byte header */
-    buf[off++] = d->node_idx;
-    buf[off++] = (uint8_t)d->identity.transport;
-    buf[off++] = (uint8_t)(p->present & 0xFF);
-    buf[off++] = (uint8_t)((p->present >> 8) & 0xFF);
- 
-    /* IMU — 2 bytes each, only if all three axes present */
-    if ((p->present & SENSOR_HAS_ACCEL) == SENSOR_HAS_ACCEL) {
-        WRITE_I16(buf, off, p->ax);
-        WRITE_I16(buf, off, p->ay);
-        WRITE_I16(buf, off, p->az);
-    }
-    if ((p->present & SENSOR_HAS_GYRO) == SENSOR_HAS_GYRO) {
-        WRITE_I16(buf, off, p->gx);
-        WRITE_I16(buf, off, p->gy);
-        WRITE_I16(buf, off, p->gz);
-    }
- 
-    /* Environmental — divide by 10 to fit int16_t range */
-    if (p->present & SENSOR_HAS_TEMP) { WRITE_I16(buf, off, p->temp / 10); }
-    if (p->present & SENSOR_HAS_HUM)  { WRITE_I16(buf, off, p->hum  / 10); }
- 
-    /* Air quality — plain integers, fit in uint16_t */
-    if (p->present & SENSOR_HAS_TVOC) { WRITE_U16(buf, off, p->tvoc); }
-    if (p->present & SENSOR_HAS_ECO2) { WRITE_U16(buf, off, p->eco2); }
- 
-    /* Biometric */
-    if (p->present & SENSOR_HAS_HEART_RATE) {
-        buf[off++] = (uint8_t)p->heart_rate;   /* 1 byte, 0–255 bpm */
-    }
-    if (p->present & SENSOR_HAS_SPO2) { WRITE_U16(buf, off, p->spo2 / 10); }
-    if (p->present & SENSOR_HAS_PM25) { WRITE_U16(buf, off, p->pm25); }
-    if (p->present & SENSOR_HAS_PM10) { WRITE_U16(buf, off, p->pm10); }
-    if (p->present & SENSOR_HAS_SWITCH) {
-        buf[off++] = p->switch_state; /* 1 byte, 0=off, 1=on */
-    }
- 
-    return off;
-}
- 
-#undef WRITE_I16
-#undef WRITE_U16
 //===============================================================
 // LoRa send thread and queue
 //===============================================================
@@ -464,7 +384,7 @@ static void forward_ble_nus(const struct node_sensor_data *d)
 static void forward_lora(const struct node_sensor_data *d)
 {
     lora_frame_t frame = {0};
-    frame.len = (uint8_t)build_wire(d, frame.data, sizeof(frame.data));
+    frame.len = (uint8_t)wire_build(d, frame.data, sizeof(frame.data));
     if(frame.len <= 0) return;
     
     LOG_DBG("Forwarding to LoRa (node %d, %d bytes)", d->node_idx, frame.len);
@@ -541,7 +461,7 @@ void data_handler_cmd(const char *cmd, uint16_t len)
     /* ── start_provisioning ──────────────────────────────────────*/
     if (strstr(cmd, "\"start_provisioning\"")) {
         LOG_INF("Provisioning started via dashboard");
-        model_handler_start_provisioning();
+        ble_mesh_handler_start_provisioning();
         return;
     }
 
@@ -574,7 +494,7 @@ void data_handler_cmd(const char *cmd, uint16_t len)
             }
         }
  
-        model_handler_unprovision_node(mesh_addr);
+        ble_mesh_handler_unprovision_node(mesh_addr);
         return;
     }
    /* ── add_rule ────────────────────────────────────────────────*/
@@ -672,7 +592,7 @@ void data_handler_cmd(const char *cmd, uint16_t len)
         p = strchr(p, ':');
         if (!p) { LOG_WRN("reconfigure: malformed"); return; }
         uint16_t mesh_addr = (uint16_t)atoi(p + 1);
-        model_handler_reconfigure_node(mesh_addr);
+        ble_mesh_handler_reconfigure_node(mesh_addr);
         return;
     }
 

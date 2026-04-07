@@ -141,4 +141,8 @@ void data_handler_cmd(const char *cmd, uint16_t len);
 
 uint8_t data_handler_get_node_idx_by_mesh_addr(uint16_t mesh_addr);
 
+void identity_str(const node_identity_t *id, char *buf, size_t size);
+
+uint8_t data_handler_get_node_idx_by_ipv6(const char *ipv6);
+
 #endif /* DATA_HANDLER_H */

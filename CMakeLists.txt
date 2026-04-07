@@ -12,6 +12,8 @@ target_sources(app PRIVATE
     src/data_handler.c
     src/semantic_handler.c
     src/mesh_ctrl.c
-    src/rule_engine.c)
+    src/rule_engine.c
+    src/mesh_parser.c
+    src/wire_format.c)
 
 target_include_directories(app PRIVATE inc)

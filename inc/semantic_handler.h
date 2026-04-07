@@ -18,7 +18,7 @@
  * NOT responsible for:
  *   - Receiving or parsing packets  → data_handler.c
  *   - Forwarding via BLE/LoRa       → data_handler.c
- *   - Mesh configuration            → model_handler.c
+ *   - Mesh configuration            → ble_mesh_handler.c
  */
 
 /* ── Node semantic states ─────────────────────────────────────── */

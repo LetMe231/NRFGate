@@ -27,7 +27,7 @@
 #include <dk_buttons_and_leds.h>
 
 #include "main.h"
-#include "model_handler.h"
+#include "ble_mesh_handler.h"
 #include "thread_handler.h"
 #include "lora_handler.h"
 #include "ble_nus.h"
@@ -209,8 +209,8 @@ static void bt_ready(int err)
         return;
     }
 
-    err = bt_mesh_init(model_handler_prov_init(),
-                       model_handler_comp_init());
+    err = bt_mesh_init(ble_mesh_handler_prov_init(),
+                       ble_mesh_handler_comp_init());
     if (err) {
         LOG_ERR("Mesh init failed (err %d)", err);
         return;
@@ -221,7 +221,7 @@ static void bt_ready(int err)
         settings_load();
     }
 
-    model_handler_self_provision();
+    ble_mesh_handler_self_provision();
     
     dk_set_led_on(DK_LED2);
     LOG_INF("=== BLE Mesh Gateway ready ===");
@@ -247,7 +247,7 @@ static void button_handler(uint32_t button_state, uint32_t has_changed)
     /* Button 2: Open provisioning window */
     if ((has_changed & DK_BTN3_MSK) && (button_state & DK_BTN3_MSK)) {
         LOG_INF("Starting provisioning...");
-        model_handler_start_provisioning();
+        ble_mesh_handler_start_provisioning();
 }
 }
 
