@@ -1,0 +1,6 @@
+# graphify runtime dependencies
+graphviz>=0.20
+pycparser>=2.21
+networkx>=3.0
+matplotlib>=3.7
+west>=1.2
