@@ -80,6 +80,9 @@ static const uint8_t app_key[16] = {
 #define FIRST_NODE_ADDR     0x0002
 #define SENSOR_CLI_MODEL_ID 0x1102
 
+/* Global timestamp for last received Mesh message */
+int64_t g_last_mesh_rx_ms = 0; 
+
 /* ── Sensor Status Opcode ────────────────────────────────────── */
 
 #define BT_MESH_MODEL_OP_SENSOR_STATUS BT_MESH_MODEL_OP_1(0x52)
@@ -89,92 +92,16 @@ static struct k_work_delayable unprovision_work;
 
 /* ── Sensor Status Payload Parser ────────────────────────────── */
 
-static void process_sensor_status(const uint8_t *data, uint16_t len, uint16_t src_addr)
+static void process_sensor_status(const uint8_t *data, uint16_t len,
+                                  uint16_t src_addr, int8_t rssi, uint8_t hops)
 {
     struct sensor_payload p = {0};
-    uint16_t offset = 0;
-
-    while (offset + 2 <= len) {
-        uint16_t mpid = data[offset] | (data[offset + 1] << 8);
-        uint16_t prop_id;
-        uint8_t data_len;
-
-        if (!mesh_parse_mpid_format_a(mpid, &prop_id, &data_len)) {
-            break;
-        }
-
-        offset += 2;
-
-        if (offset + data_len > len) {
-            LOG_WRN("Property 0x%04X truncated", prop_id);
-            break;
-        }
-
-        const uint8_t *val = &data[offset];
-        offset += data_len;
-
-        switch (prop_id) {
-        case PROP_SENSOR_SEQ:
-            p.seq = mesh_read_le_signed(val, data_len);
-            p.present |= SENSOR_HAS_SEQ;
-            break;
-        case PROP_TEMPERATURE: {
-            // ble mesh: 0.01%RH steps, so multiply by 10 for 0.1°C steps
-            p.temp = mesh_read_le_signed(val, data_len) * 10;
-            p.present |= SENSOR_HAS_TEMP;
-            break;
-        }
-        case PROP_HUMIDITY: {
-            // ble mesh: 0.01%RH steps, so multiply by 10 for 0.1% steps
-            p.hum = (int32_t)mesh_read_le_unsigned(val, data_len) * 10;
-            p.present |= SENSOR_HAS_HUM;
-            break;
-        }
-        case PROP_ECO2:
-            // ppm no scaling
-            p.eco2 = mesh_read_le_unsigned(val, data_len);
-            p.present |= SENSOR_HAS_ECO2;
-            break;
-        case PROP_TVOC:
-            // ppb no scaling
-            p.tvoc = mesh_read_le_unsigned(val, data_len);
-            p.present |= SENSOR_HAS_TVOC;
-            break;
-        case PROP_HEART_RATE:
-            // bpm no scaling
-            p.heart_rate = mesh_read_le_unsigned(val, data_len);
-            p.present |= SENSOR_HAS_HEART_RATE;
-            break;
-        case PROP_SPO2:
-            // ble mesh: 0.01% steps, so multiply by 10 for 0.1% steps
-            p.spo2 = (int32_t)mesh_read_le_unsigned(val, data_len) * 10;
-            p.present |= SENSOR_HAS_SPO2;
-            break;
-        case PROP_RAW_RED:
-            // raw sensor value, no scaling
-            p.raw_red = mesh_read_le_unsigned(val, data_len);
-            p.present |= SENSOR_HAS_RAW_RED;
-            break;
-        case PROP_RAW_IR:
-            // raw sensor value, no scaling
-            p.raw_ir = mesh_read_le_unsigned(val, data_len);
-            p.present |= SENSOR_HAS_RAW_IR;
-            break;
-        case PROP_SWITCH:
-            p.switch_state = (uint8_t)mesh_read_le_unsigned(val, data_len);
-            if (p.switch_state)                p.present |= SENSOR_HAS_SWITCH;
-            break;
-        default:
-            LOG_WRN("Unknown Property 0x%04X (%u bytes)", prop_id, data_len);
-        }
-    }
-
-    if (p.present == 0) {
-        LOG_WRN("Sensor Status from 0x%04X had no recognised properties",
-                src_addr);
+    bool ok = mesh_parse_sensor_status(data, len, &p);
+    if (!ok) {
+        LOG_WRN("No recognised properties from 0x%04X", src_addr);
         return;
     }
-    // Build node sensor data struct and submit to data handler
+
     struct node_sensor_data nd = {
         .identity = {
             .transport = NODE_TRANSPORT_BLE_MESH,
@@ -182,6 +109,8 @@ static void process_sensor_status(const uint8_t *data, uint16_t len, uint16_t sr
         },
         .rx_uptime_ms = k_uptime_get(),
         .payload = p,
+        .rssi  = rssi,
+        .hops  = hops,
     };
 
     data_handler_receive(&nd);
@@ -189,12 +118,27 @@ static void process_sensor_status(const uint8_t *data, uint16_t len, uint16_t sr
 
 /* ── Sensor Client Opcode Handler ────────────────────────────── */
 
+/* Publication TTL (set in configure_node_handler) */
+#define MESH_PUB_TTL 5
+
 static int sensor_status_handler(const struct bt_mesh_model *model,
                                  struct bt_mesh_msg_ctx *ctx,
                                  struct net_buf_simple *buf)
 {
-    LOG_INF("Sensor Status from 0x%04X (%u bytes)", ctx->addr, buf->len);
-    process_sensor_status(buf->data, buf->len, ctx->addr);
+    g_last_mesh_rx_ms = k_uptime_get();
+
+    /* Hop count: how many relay hops did this packet take?
+     * recv_ttl = TTL remaining when packet arrived at gateway.
+     * hops = pub_TTL - recv_ttl  (0 = direct, 1 = one relay, etc.) */
+    uint8_t hops = (ctx->recv_ttl <= MESH_PUB_TTL)
+                   ? (MESH_PUB_TTL - ctx->recv_ttl)
+                   : 0;
+    int8_t rssi = ctx->recv_rssi;
+
+    LOG_INF("Sensor Status from 0x%04X (%u bytes) rssi=%d hops=%u",
+            ctx->addr, buf->len, rssi, hops);
+
+    process_sensor_status(buf->data, buf->len, ctx->addr, rssi, hops);
     return 0;
 }
 
@@ -298,10 +242,21 @@ static void configure_handler(struct k_work *work)
                                        GATEWAY_ADDR, APP_IDX,
                                        SENSOR_CLI_MODEL_ID, &status);
     if (err) {
-        LOG_ERR("AppKey bind failed: %d", err);
+        LOG_ERR("AppKey bind failed (Sensor CLI): %d", err);
         schedule_gateway_retry();
         return;
     }
+
+    /* Bind Generic OnOff Client — required to send ON/OFF to lamp nodes */
+    err = bt_mesh_cfg_cli_mod_app_bind(NET_IDX, GATEWAY_ADDR,
+                                       GATEWAY_ADDR, APP_IDX,
+                                       MESH_CTRL_ONOFF_CLI_ID, &status);
+    if (err && err != -EALREADY) {
+        LOG_ERR("AppKey bind failed (OnOff CLI): %d", err);
+        schedule_gateway_retry();
+        return;
+    }
+    LOG_INF("Generic OnOff Client bound to AppKey 0x%04X", APP_IDX);
 
     err = bt_mesh_cfg_cli_mod_sub_add(NET_IDX, GATEWAY_ADDR,
                                       GATEWAY_ADDR, GROUP_ADDR,
@@ -332,6 +287,14 @@ static void schedule_node_retry(void)
 
     LOG_WRN("Node config retry #%d in %u ms",
             node_retry_count + 1, delay_ms);
+    if (ble_nus_is_ready()) {
+        char buf[80];
+        snprintf(buf, sizeof(buf),
+                 "{\"type\":\"prov_event\",\"event\":\"retry\","
+                 "\"addr\":%u,\"attempt\":%d}\n",
+                 pending_node_addr, node_retry_count + 1);
+        ble_nus_send(buf);
+    }
     node_retry_count++;
     mesh_scheduler_start();
     k_work_schedule_for_queue(&config_wq, &configure_node_work,
@@ -347,6 +310,19 @@ static void configure_node_handler(struct k_work *work)
     mesh_scheduler_pause();
 
     LOG_INF("Configuring node 0x%04X...", addr);
+
+    /* Clear RPL entry for this node before configuration.
+     * After re-provisioning, the node resets seq=0 but the gateway's
+     * RPL still has old (higher) seq numbers → all config messages
+     * are blocked as replays → AppKey/bind/pub silently fail.
+     * Deleting the RPL entry lets the gateway accept seq=0 again. */
+    char rpl_key[24];
+    snprintf(rpl_key, sizeof(rpl_key), "bt/mesh/RPL/%x", addr);
+    settings_delete(rpl_key);
+    LOG_INF("  RPL entry cleared for 0x%04X", addr);
+
+    /* Brief delay so the RPL deletion takes effect before sending */
+    k_msleep(100);
 
     /* 1. Add AppKey */
     err = bt_mesh_cfg_cli_app_key_add(NET_IDX, addr,
@@ -387,13 +363,37 @@ static void configure_node_handler(struct k_work *work)
         LOG_INF("Generic OnOff Server bound");
     }
 
-    /* 3. Set publication to group address */
+    /* 3. Enable Relay — allows multi-hop mesh.
+     *
+     * retransmit = BT_MESH_TRANSMIT(0, 0) means each relay node
+     * forwards a packet exactly ONCE (no retransmit).
+     *
+     * Compare: original sender uses TRANSMIT(2,20) = 3 total TX.
+     * Relay nodes forward only 1×, so total packets per hop = N_relays × 1
+     * instead of N_relays × 3. The gateway RPL deduplicates silently.
+     *
+     * TTL=5 on publication limits flood radius to 5 hops max.
+     */
+    uint8_t relay_status, transmit_status;
+    err = bt_mesh_cfg_cli_relay_set(NET_IDX, addr,
+                                    BT_MESH_RELAY_ENABLED,
+                                    BT_MESH_TRANSMIT(0, 0),
+                                    &relay_status, &transmit_status);
+    if (err == -ETIMEDOUT) {
+        LOG_WRN("  Relay set timed out — assuming enabled");
+    } else if (err) {
+        LOG_WRN("  Relay set failed: %d (non-fatal)", err);
+    } else {
+        LOG_INF("  Relay enabled on 0x%04X (1x forward, no retransmit)", addr);
+    }
+
+    /* 4. Set publication to group address */
     struct bt_mesh_cfg_cli_mod_pub pub = {
         .addr      = GROUP_ADDR,
         .app_idx   = APP_IDX,
-        .ttl       = 7,
+        .ttl       = 5,  /* 5 hops max — enough for most deployments */
         .period    = 0,
-        .transmit  = 0,
+        .transmit  = BT_MESH_TRANSMIT(2, 20),  /* 3 total TX, 20ms interval */
         .cred_flag = false,
     };
 
@@ -411,6 +411,47 @@ static void configure_node_handler(struct k_work *work)
     }
 
    LOG_INF("=== Node 0x%04X fully configured ===", addr);
+
+    if (ble_nus_is_ready()) {
+        char buf[64];
+        snprintf(buf, sizeof(buf),
+                 "{\"type\":\"prov_event\",\"event\":\"configured\",\"addr\":%u}\n",
+                 addr);
+        ble_nus_send(buf);
+    }
+
+#if IS_ENABLED(CONFIG_BT_MESH_DF_CLI)
+    /* Configure Directed Forwarding path: node → gateway.
+     * This tells the node to discover and cache the optimal path
+     * to GATEWAY_ADDR (0x0001) so only path nodes forward messages.
+     *
+     * Discovery uses RSSI — nodes that can't hear each other won't
+     * be selected as intermediate hops. Multi-hop only activates
+     * when the direct path is unavailable. */
+    struct bt_mesh_df_path_metric pm = {
+        .metric    = BT_MESH_DF_METRIC_TYPE_NODE_COUNT,
+        .threshold = 5,
+    };
+    err = bt_mesh_df_cli_directed_forwarding_table_entries_delete(
+              NET_IDX, addr, GATEWAY_ADDR);
+    (void)err;  /* ignore if no entry exists */
+
+    uint16_t df_status;
+    err = bt_mesh_df_cli_path_request(
+              NET_IDX, addr,
+              GATEWAY_ADDR,   /* destination: gateway */
+              0x00FF,         /* dependent originator: unicast only */
+              &pm,
+              &df_status);
+    if (err == -ETIMEDOUT) {
+        LOG_WRN("  DF path request timed out — flooding fallback");
+    } else if (err) {
+        LOG_WRN("  DF path request failed: %d (node may not support DF)", err);
+    } else {
+        LOG_INF("  DF path established: 0x%04X → 0x%04X (status=%d)",
+                addr, GATEWAY_ADDR, df_status);
+    }
+#endif
 
     if (IS_ENABLED(CONFIG_SETTINGS)) {
         settings_save();
@@ -563,6 +604,16 @@ static void node_added_cb(uint16_t net_idx, uint8_t uuid[16],
     prov_in_progress = false;
     next_node_addr = addr + num_elem;
 
+    /* Notify dashboard: node provisioned, now configuring */
+    if (ble_nus_is_ready()) {
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+                 "{\"type\":\"prov_event\",\"event\":\"provisioned\","
+                 "\"addr\":%u,\"uuid\":\"%02x%02x%02x%02x\"}\n",
+                 addr, uuid[0], uuid[1], uuid[2], uuid[3]);
+        ble_nus_send(buf);
+    }
+
     struct bt_mesh_cdb_node *node = bt_mesh_cdb_node_get(addr);
     if (node) {
         bt_mesh_cdb_node_store(node);
@@ -611,6 +662,106 @@ static void prov_complete(uint16_t net_idx, uint16_t addr)
     k_work_schedule_for_queue(&config_wq, &configure_work, K_NO_WAIT);
 }
 
+
+/* ── CDB Lifecycle Management ────────────────────────────────────
+ *
+ * Nodes accumulate in CDB across reflashes/reboots if not explicitly
+ * removed. Two cleanup mechanisms:
+ *
+ * 1. cdb_purge_lost_nodes(): removes nodes that semantic_handler
+ *    has marked LOST (no data for >90s). Called periodically.
+ *
+ * 2. cdb_full_reset(): complete mesh reset for factory/dev use.
+ *    Triggered via NUS {"cmd":"reset_mesh"}.
+ */
+
+static uint8_t _purge_lost_cb(struct bt_mesh_cdb_node *node, void *user_data)
+{
+    if (node->addr == GATEWAY_ADDR) {
+        return BT_MESH_CDB_ITER_CONTINUE;
+    }
+    uint8_t idx = data_handler_get_node_idx_by_mesh_addr(node->addr);
+    if (idx == 0xFF) {
+        /* Unknown to data_handler — stale from old session */
+        LOG_WRN("CDB purge: 0x%04X unknown to data_handler — removing", node->addr);
+        bt_mesh_cdb_node_del(node, true);
+        return BT_MESH_CDB_ITER_CONTINUE;
+    }
+    if (semantic_handler_get_state(idx) == NODE_STATE_LOST) {
+        int *count = (int *)user_data;
+        (*count)++;
+        LOG_WRN("CDB purge: 0x%04X LOST for >%d s — removing",
+                node->addr, (int)(node_lost_timeout_ms / 1000));
+        bt_mesh_cdb_node_del(node, true);
+    }
+    return BT_MESH_CDB_ITER_CONTINUE;
+}
+
+void ble_mesh_handler_purge_lost_nodes(void)
+{
+    int removed = 0;
+    bt_mesh_cdb_node_foreach(_purge_lost_cb, &removed);
+    if (removed > 0) {
+        LOG_INF("CDB purge: removed %d LOST node(s)", removed);
+        if (IS_ENABLED(CONFIG_SETTINGS)) settings_save();
+    } else {
+        LOG_INF("CDB purge: no stale nodes found");
+    }
+}
+
+static uint8_t _delete_all_nodes_cb(struct bt_mesh_cdb_node *node, void *user_data)
+{
+    LOG_WRN("CDB reset: deleting node 0x%04X", node->addr);
+    bt_mesh_cdb_node_del(node, true);
+    return BT_MESH_CDB_ITER_CONTINUE;
+}
+
+void ble_mesh_handler_full_reset(void)
+{
+    LOG_WRN("=== FULL MESH RESET requested ===");
+
+    /* Delete CDB nodes from RAM + NVS explicitly.
+     * bt_mesh_cdb_node_del(node, true) calls settings_delete internally
+     * for each node key (bt/mesh/cdb/Node/X). */
+    bt_mesh_cdb_node_foreach(_delete_all_nodes_cb, NULL);
+
+    /* Also explicitly delete known CDB settings keys via settings_delete.
+     * This is belt-and-suspenders: even if the foreach missed something,
+     * the NVS entries are gone before bt_mesh_reset() runs. */
+    for (uint16_t addr = 1; addr <= 0x0020; addr++) {
+        char key[32];
+        snprintf(key, sizeof(key), "bt/mesh/cdb/Node/%x", addr);
+        settings_delete(key);
+    }
+
+    /* bt_mesh_reset() clears all mesh credentials (Net, IV, Seq, RPL, AppKey)
+     * and calls settings_delete for each. The CDB subnet is NOT cleared by
+     * bt_mesh_reset — we already handled nodes above. */
+    bt_mesh_reset();
+
+    /* Clear CDB subnet key too so cdb_create works fresh on reboot */
+    settings_delete("bt/mesh/cdb/Net");
+    settings_delete("bt/mesh/cdb/Subnet/0");
+    settings_delete("bt/mesh/cdb");
+
+    LOG_WRN("Full mesh reset complete — rebooting now");
+    k_msleep(200);
+    NVIC_SystemReset();
+}
+
+/* Periodic purge work — runs every 5 minutes */
+#define CDB_PURGE_INTERVAL_S 300
+
+static void cdb_periodic_purge_fn(struct k_work *w);
+static K_WORK_DELAYABLE_DEFINE(s_cdb_purge_work, cdb_periodic_purge_fn);
+
+static void cdb_periodic_purge_fn(struct k_work *w)
+{
+    ble_mesh_handler_purge_lost_nodes();
+    k_work_schedule_for_queue(&config_wq, &s_cdb_purge_work,
+                              K_SECONDS(CDB_PURGE_INTERVAL_S));
+}
+
 static void self_provision(void)
 {
     int err;
@@ -626,6 +777,8 @@ static void self_provision(void)
         configure_retry_count = 0;
         k_work_schedule_for_queue(&config_wq, &configure_work, K_NO_WAIT);
         init_next_node_addr();
+        /* Start periodic CDB cleanup (first run after 60s to let nodes re-register) */
+        k_work_schedule_for_queue(&config_wq, &s_cdb_purge_work, K_SECONDS(60));
         return;
     }
 
@@ -638,9 +791,51 @@ static void self_provision(void)
             dev_uuid[12], dev_uuid[13], dev_uuid[14], dev_uuid[15]);
 
     err = bt_mesh_cdb_create(net_key);
-    if (err && err != -EALREADY) {
+    if (err && err != -EALREADY && err != -ENOMEM) {
         LOG_ERR("CDB create failed: %d", err);
         return;
+    }
+    if (err) {
+        /* -EALREADY or -ENOMEM: CDB subnet slot occupied by stale settings.
+         * Nodes and subnet keys were deleted above — recreate cleanly. */
+        LOG_WRN("CDB occupied (err=%d) — resetting CDB state", err);
+        bt_mesh_cdb_clear();
+        err = bt_mesh_cdb_create(net_key);
+        if (err) {
+            LOG_ERR("CDB re-create failed: %d", err);
+            return;
+        }
+    }
+
+    /* Purge ALL existing CDB nodes before fresh provisioning.
+     * On reboot after reset_mesh, old nodes (e.g. Node/1, Node/3) are
+     * reloaded from NVS before our code runs. They must all be removed
+     * so bt_mesh_provision() can allocate a fresh CDB entry for 0x0001.
+     * Only deleting the gateway entry is not enough — other lingering
+     * nodes consume CDB slots and cause -ENOMEM. */
+    int purge_count = 0;
+    struct bt_mesh_cdb_node *n;
+    uint16_t a = 1;
+    while ((n = bt_mesh_cdb_node_get(a)) != NULL) {
+        LOG_WRN("Pre-prov purge: removing CDB node 0x%04X", n->addr);
+        a = n->addr + n->num_elem;
+        bt_mesh_cdb_node_del(n, true);
+        purge_count++;
+    }
+    /* Belt-and-suspenders: explicitly delete known settings keys */
+    for (uint16_t addr = 1; addr <= 0x20; addr++) {
+        char key[32];
+        snprintf(key, sizeof(key), "bt/mesh/cdb/Node/%x", addr);
+        settings_delete(key);
+    }
+    /* Also delete CDB subnet/net keys — these survive bt_mesh_reset()
+     * and cause bt_mesh_cdb_create() to fail with -ENOMEM. */
+    settings_delete("bt/mesh/cdb/Net");
+    settings_delete("bt/mesh/cdb/Subnet/0");
+
+    if (purge_count > 0 || true) {
+        LOG_INF("CDB pre-prov purge: %d nodes removed", purge_count);
+        if (IS_ENABLED(CONFIG_SETTINGS)) settings_save();
     }
 
     err = bt_mesh_provision(net_key, NET_IDX, 0, 0,
@@ -681,6 +876,10 @@ BT_MESH_HEALTH_PUB_DEFINE(health_pub, 0x00);
 
 static struct bt_mesh_cfg_cli cfg_cli = {};
 
+#if IS_ENABLED(CONFIG_BT_MESH_DF_CLI)
+static struct bt_mesh_df_cli s_df_cli = {};
+#endif
+
 static struct bt_mesh_model root_models[] = {
     BT_MESH_MODEL_CFG_SRV,
     BT_MESH_MODEL_CFG_CLI(&cfg_cli),
@@ -689,6 +888,10 @@ static struct bt_mesh_model root_models[] = {
     /* Generic OnOff Client — controls commercial BLE Mesh lamps */
     BT_MESH_MODEL(MESH_CTRL_ONOFF_CLI_ID, onoff_cli_ops,
                   &onoff_cli_pub, NULL),
+#if IS_ENABLED(CONFIG_BT_MESH_DF_CLI)
+    /* Directed Forwarding Client — configures DF paths on nodes (BT Mesh 1.1) */
+    BT_MESH_MODEL_DF_CLI(&s_df_cli),
+#endif
 };
 
 static struct bt_mesh_elem elements[] = {

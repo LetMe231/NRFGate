@@ -24,3 +24,5 @@ void ble_mesh_handler_unprovision_node(uint16_t mesh_addr);
 void ble_mesh_handler_reconfigure_node(uint16_t mesh_addr);
 #endif /* BLE_MESH_HANDLER_H */
  
+void ble_mesh_handler_purge_lost_nodes(void);
+void ble_mesh_handler_full_reset(void);

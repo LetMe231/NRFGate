@@ -24,6 +24,7 @@
 #include "main.h"
 #include "semantic_handler.h"
 #include "rule_engine.h"
+#include "wire_format.h"
 
 LOG_MODULE_REGISTER(data_handler, LOG_LEVEL_INF);
 
@@ -31,7 +32,11 @@ typedef struct{
     node_identity_t identity;
     int64_t first_seen_ms;
     int64_t last_seen_ms;
+    int64_t prev_seen_ms;
+    int64_t estimated_period_ms;
     uint32_t packet_count;
+    int32_t last_seq;
+    uint32_t seq_gaps;
 } node_entry_t;
 
 static node_entry_t node_table[MAX_NODES];
@@ -110,30 +115,51 @@ static const char *transport_str(node_transport_t t)
 }
 
  static uint8_t register_or_find_node(const node_identity_t *id, int64_t now_ms){
-    // node already exists?
     k_mutex_lock(&s_node_mutex, K_FOREVER);
+    
     for(uint8_t i=0; i<node_count; i++){
-        if(identity_match(&node_table[i].identity, id)){
+        if (identity_match(&node_table[i].identity, id)) {
+
+            // Estimate packet interval using the last two receptions, ignore implausible intervals
+            if (node_table[i].last_seen_ms > 0) {
+                int64_t interval = now_ms - node_table[i].last_seen_ms;
+
+                // Ignore implausible intervals
+                if (interval >= 1000 && interval <= 600000) {
+                    if (node_table[i].estimated_period_ms == 0) {
+                        // First estimate
+                        node_table[i].estimated_period_ms = interval;
+                    } else {
+                        // Exponential moving average (α=0.3)
+                        node_table[i].estimated_period_ms =
+                            (node_table[i].estimated_period_ms * 7 +
+                            interval * 3) / 10;
+                    }
+                }
+            }
+
+            node_table[i].prev_seen_ms = node_table[i].last_seen_ms;
             node_table[i].last_seen_ms = now_ms;
             node_table[i].packet_count++;
+            k_mutex_unlock(&s_node_mutex);
             return i;
         }
     }
 
-    // new node
     if(node_count >= MAX_NODES){
         char id_str[NODE_ADDR_STR_LEN];
         identity_str(id, id_str, sizeof(id_str));
         LOG_ERR("Node table full (%d/%d), dropping %s",
                 node_count, MAX_NODES, id_str);
+        k_mutex_unlock(&s_node_mutex);  // ← NEU
         return 0xFF;
     }
     
     uint8_t idx = node_count++;
-    node_table[idx].identity       = *id;
-    node_table[idx].first_seen_ms  = now_ms;
-    node_table[idx].last_seen_ms   = now_ms;
-    node_table[idx].packet_count   = 1;
+    node_table[idx].identity      = *id;
+    node_table[idx].first_seen_ms = now_ms;
+    node_table[idx].last_seen_ms  = now_ms;
+    node_table[idx].packet_count  = 1;
     
     char id_str[NODE_ADDR_STR_LEN];
     identity_str(id, id_str, sizeof(id_str));
@@ -152,8 +178,14 @@ static void log_sensor_data(const struct node_sensor_data *d){
     char src[NODE_ADDR_STR_LEN];
     identity_str(&d->identity, src, sizeof(src));
     const char *tr = transport_str(d->identity.transport);
-    char hdr[80];
-    snprintf(hdr, sizeof(hdr), "[Node %d | %s | %s] rx=%lld ms seq=%d", d->node_idx, tr, src, (long long )d->rx_uptime_ms, d->payload.seq);
+    char hdr[128];
+    if (p->present & SENSOR_HAS_SEQ) {
+        snprintf(hdr, sizeof(hdr), "[Node %d | %s | %s] rx=%lld ms seq=%d",
+                d->node_idx, tr, src, (long long)d->rx_uptime_ms, p->seq);
+    } else {
+        snprintf(hdr, sizeof(hdr), "[Node %d | %s | %s] rx=%lld ms seq=-",
+                d->node_idx, tr, src, (long long)d->rx_uptime_ms);
+    }
 
     LOG_INF("%s", hdr);
 
@@ -206,6 +238,9 @@ static void log_sensor_data(const struct node_sensor_data *d){
     if(p->present & SENSOR_HAS_SWITCH){
         LOG_INF("  Switch: %s", p->switch_state ? "PRESSED" : "IDLE");
     }
+    if (p->present & SENSOR_HAS_LIGHT) {
+        LOG_INF("  Light: %s", p->light_on ? "ON" : "OFF");
+    }
 }
 
 
@@ -253,6 +288,10 @@ static int build_json(const struct node_sensor_data *d,
     }
     if (d->identity.transport == NODE_TRANSPORT_BLE_MESH) {
         JSON_APPEND(",\"mesh_addr\":%d", d->identity.mesh_addr);
+        JSON_APPEND(",\"rssi\":%d",      d->rssi);
+        JSON_APPEND(",\"hops\":%u",       d->hops);
+        JSON_APPEND(",\"rssi\":%d",      d->rssi);
+        JSON_APPEND(",\"hops\":%d",       d->hops);
     }
  
     // IMU — only for Thread/IMU nodes
@@ -400,6 +439,9 @@ static void forward_lora(const struct node_sensor_data *d)
 
 int data_handler_init(void){
     memset(node_table, 0, sizeof(node_table));
+    for (int i = 0; i < MAX_NODES; i++) {
+        node_table[i].last_seq = -1;
+    }
     node_count = 0;
 
     // start LoRa send thread
@@ -412,6 +454,35 @@ int data_handler_init(void){
     return 0;
 }
 
+// ========= Testing ============================================= 
+static void update_seq_stats(node_entry_t *entry,
+                              const struct sensor_payload *p)
+{
+    if (!(p->present & SENSOR_HAS_SEQ)) return;
+    if (entry->last_seq >= 0) {
+        int32_t expected = entry->last_seq + 1;
+        int32_t gap      = p->seq - expected;
+        if (gap > 0 && gap < 1000) {   /* Ignoriere Wraparound */
+            entry->seq_gaps += (uint32_t)gap;
+        }
+    }
+    entry->last_seq = p->seq;
+}
+// ===============================================================
+
+static bool is_duplicate_ble_event(node_entry_t *entry, const struct sensor_payload *p)
+{
+    if (!(p->present & SENSOR_HAS_SEQ)) {
+        return false;
+    }
+
+    if (entry->last_seq >= 0 && p->seq == entry->last_seq) {
+        return true;
+    }
+
+    return false;
+}
+
 void data_handler_receive(const struct node_sensor_data *data){
     struct node_sensor_data d = *data; // make a local copy
 
@@ -421,9 +492,18 @@ void data_handler_receive(const struct node_sensor_data *data){
         return;
     }
 
+    if (d.identity.transport == NODE_TRANSPORT_BLE_MESH && is_duplicate_ble_event(&node_table[d.node_idx], &d.payload)) {
+        LOG_DBG("Duplicate BLE event (node %d seq %d), ignoring",
+                d.node_idx, d.payload.seq);
+        return;
+    }
+
     log_sensor_data(&d);
 
-    semantic_handler_process(&d);
+    // Testing
+    update_seq_stats(&node_table[d.node_idx], &d.payload);
+
+    semantic_handler_process((const struct node_sensor_data *)&d);
 
     if (d.payload.present & SENSOR_HAS_SWITCH) {
         rule_engine_on_switch(d.node_idx, d.payload.switch_state != 0, d.identity.transport);
@@ -454,6 +534,82 @@ void data_handler_receive(const struct node_sensor_data *data){
     }
 }
 
+// ============== Testing =============================================
+int data_handler_get_diag(node_diag_t *out, uint8_t max_nodes)
+{
+    k_mutex_lock(&s_node_mutex, K_FOREVER);
+    uint8_t count = MIN(node_count, max_nodes);
+    for (uint8_t i = 0; i < count; i++) {
+        out[i].node_idx     = i;
+        out[i].packet_count = node_table[i].packet_count;
+        out[i].first_seen_ms = node_table[i].first_seen_ms;
+        out[i].last_seen_ms  = node_table[i].last_seen_ms;
+        out[i].last_seq      = node_table[i].last_seq;
+        out[i].seq_gaps      = node_table[i].seq_gaps;
+        out[i].state = (uint8_t)semantic_handler_get_state(i);
+        out[i].transport     = node_table[i].identity.transport;
+        if (out[i].transport == NODE_TRANSPORT_THREAD) {
+            strncpy(out[i].addr.ipv6,
+                    node_table[i].identity.ipv6,
+                    NODE_ADDR_STR_LEN);
+        } else {
+            out[i].addr.mesh_addr = node_table[i].identity.mesh_addr;
+        }
+    }
+    k_mutex_unlock(&s_node_mutex);
+    return count;
+}
+static void send_diag(void)
+{
+    node_diag_t diag[MAX_NODES];
+    int count = data_handler_get_diag(diag, MAX_NODES);
+
+    /* Paket 1: Header */
+    char buf[180];
+    snprintf(buf, sizeof(buf),
+        "{\"diag_h\":{\"nodes\":%d,"
+        "\"ble_ms\":%lld,\"thr_ms\":%lld,"
+        "\"ble_sw\":%u,\"thr_sw\":%u}}\n",
+        count,
+        (long long)g_ble_active_ms,
+        (long long)g_thread_active_ms,
+        g_ble_switches, g_thread_switches);
+    ble_nus_send(buf);
+    k_msleep(30);
+
+    /* Pakete 2..N: Ein Paket pro Node */
+    for (int i = 0; i < count; i++) {
+        char addr_str[32];
+        if (diag[i].transport == NODE_TRANSPORT_THREAD) {
+            const char *ipv6 = diag[i].addr.ipv6;
+            size_t len = strlen(ipv6);
+            if (len > 19) {
+                snprintf(addr_str, sizeof(addr_str), "...%s", ipv6 + len - 15);
+            } else {
+                strncpy(addr_str, ipv6, sizeof(addr_str));
+            }
+        }
+        uint32_t total    = diag[i].packet_count + diag[i].seq_gaps;
+        uint32_t loss_pct = total > 0
+            ? (diag[i].seq_gaps * 100) / total : 0;
+        uint32_t age_s    = (uint32_t)
+            ((k_uptime_get() - diag[i].last_seen_ms) / 1000);
+
+        snprintf(buf, sizeof(buf),
+            "{\"diag_n\":{\"idx\":%d,\"tr\":\"%s\","
+            "\"pkts\":%u,\"gaps\":%u,\"loss\":%u,"
+            "\"seq\":%d,\"age\":%u,\"state\":\"%s\"}}\n",
+            diag[i].node_idx,
+            diag[i].transport == NODE_TRANSPORT_THREAD ? "T" : "B",
+            diag[i].packet_count, diag[i].seq_gaps, loss_pct,
+            diag[i].last_seq, age_s,
+            semantic_handler_state_str(diag[i].state));
+        ble_nus_send(buf);
+        k_msleep(30);
+    }
+}
+// ===============================================================
+
 void data_handler_cmd(const char *cmd, uint16_t len)
 {
     LOG_INF("NUS cmd: %.*s", len, cmd);
@@ -462,6 +618,22 @@ void data_handler_cmd(const char *cmd, uint16_t len)
     if (strstr(cmd, "\"start_provisioning\"")) {
         LOG_INF("Provisioning started via dashboard");
         ble_mesh_handler_start_provisioning();
+        return;
+    }
+
+    /* ── purge_nodes — remove LOST nodes from CDB ────────────────*/
+    if (strstr(cmd, "\"purge_nodes\"")) {
+        LOG_INF("CDB purge requested via dashboard");
+        ble_mesh_handler_purge_lost_nodes();
+        if (ble_nus_is_ready()) ble_nus_send("{\"type\":\"status\",\"msg\":\"CDB purged\"}\n");
+        return;
+    }
+
+    /* ── reset_mesh — full factory reset ─────────────────────────*/
+    if (strstr(cmd, "\"reset_mesh\"")) {
+        LOG_WRN("Full mesh reset requested via dashboard");
+        if (ble_nus_is_ready()) ble_nus_send("{\"type\":\"status\",\"msg\":\"Resetting...\"}\n");
+        ble_mesh_handler_full_reset();  /* triggers NVIC_SystemReset() */
         return;
     }
 
@@ -549,27 +721,43 @@ void data_handler_cmd(const char *cmd, uint16_t len)
     /* ── list_rules ──────────────────────────────────────────────*/
     if (strstr(cmd, "\"list_rules\"")) {
         char buf[512];
-        rule_engine_to_json(buf, sizeof(buf));
+        int total = rule_engine_to_json(buf, sizeof(buf));
+        if (total <= 0) return;
+        mesh_scheduler_suppress_reports(true);
         ble_nus_send(buf);
+        mesh_scheduler_suppress_reports(false);
         return;
     }
-
     /* ── remove_rule ─────────────────────────────────────────────*/
     if (strstr(cmd, "\"remove_rule\"")) {
         const char *f = strstr(cmd, "\"idx\"");
         if (!f) { LOG_WRN("remove_rule: missing idx"); return; }
         f = strchr(f, ':'); if (!f) { LOG_WRN("remove_rule: malformed"); return; }
         rule_engine_remove((uint8_t)atoi(f + 1));
-        /* Sofort aktualisierte Liste zurückschicken */
         char buf[512];
-        rule_engine_to_json(buf, sizeof(buf));
+        int total = rule_engine_to_json(buf, sizeof(buf));
+        if (total <= 0) return;
+        mesh_scheduler_suppress_reports(true);
         ble_nus_send(buf);
+        mesh_scheduler_suppress_reports(false);
         return;
     }
+
+    // ping for keepalive — ignored silently to avoid log spam if user clicks multiple times
+    if (strstr(cmd, "\"ping\"")) {
+        return;  // silent ignore
+    }
+
+    // Testing 
+    if (strstr(cmd, "\"diag\"")) {
+        send_diag();
+        return;
+    }
+ 
     /* ── lora_enabled ────────────────────────────────────────────*/
-    {
+    if (strstr(cmd, "\"lora_enabled\"")) {
         const char *p = strstr(cmd, "\"lora_enabled\"");
-        if (!p) { LOG_WRN("Unknown command: %.*s", len, cmd); return; }  /* ← return war hier weg */
+        if (!p) { LOG_WRN("Unknown command: %.*s", len, cmd); return; }
 
         p = strchr(p, ':');
         if (!p) { LOG_WRN("Malformed lora_enabled command"); return; }
@@ -597,4 +785,26 @@ void data_handler_cmd(const char *cmd, uint16_t len)
     }
 
      LOG_WRN("Unknown command: %.*s", len, cmd);
+}
+
+int data_handler_get_mesh_schedules(mesh_node_schedule_t *out,
+                                     uint8_t max_nodes)
+{
+    k_mutex_lock(&s_node_mutex, K_FOREVER);
+    int count = 0;
+    for (uint8_t i = 0; i < node_count && count < max_nodes; i++) {
+        if (node_table[i].identity.transport != NODE_TRANSPORT_BLE_MESH)
+            continue;
+        if (node_table[i].estimated_period_ms == 0)
+            continue;  // Noch kein Schätzwert
+
+        out[count].mesh_addr           = node_table[i].identity.mesh_addr;
+        out[count].last_rx_ms          = node_table[i].last_seen_ms;
+        out[count].estimated_period_ms = node_table[i].estimated_period_ms;
+        out[count].predicted_next_ms   = node_table[i].last_seen_ms +
+                                         node_table[i].estimated_period_ms;
+        count++;
+    }
+    k_mutex_unlock(&s_node_mutex);
+    return count;
 }

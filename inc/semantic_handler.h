@@ -1,6 +1,7 @@
 #ifndef SEMANTIC_HANDLER_H
 #define SEMANTIC_HANDLER_H
 
+struct node_sensor_data;  // forward declaration to avoid circular dependency
 #include "data_handler.h"
 
 /**

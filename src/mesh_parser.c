@@ -108,7 +108,11 @@ bool mesh_parse_sensor_status(const uint8_t *data, uint16_t len,
             break;
         case PROP_SWITCH:
             out->switch_state = (uint8_t)mesh_read_le_unsigned(val, data_len);
-            if (out->switch_state) out->present |= SENSOR_HAS_SWITCH;
+            out->present |= SENSOR_HAS_SWITCH;
+            break;
+        case PROP_LIGHT_STATE:
+            out->light_on = (uint8_t)mesh_read_le_unsigned(val, data_len);
+            out->present |= SENSOR_HAS_LIGHT;
             break;
         default:
             LOG_WRN("Unknown Property 0x%04X (%u bytes)", prop_id, data_len);

@@ -26,7 +26,7 @@ int32_t thresh_tvoc_alert    = 500;
 int32_t thresh_motion_active = 400;
 int32_t thresh_motion_alert  = 10000;
 int32_t thresh_temp_alert    = 38000;  /* m°C = 38.0 °C */
-int32_t node_lost_timeout_ms = 30000;
+int32_t node_lost_timeout_ms = 90000;
  
 // per-node state machine
 
@@ -36,6 +36,7 @@ typedef struct{
     bool ever_seen; 
     int64_t alert_since_ms;
     bool lost_reported;
+    node_transport_t transport;
 
     struct {
         int64_t ts_ms;
@@ -81,7 +82,7 @@ static void transition(semantic_node_t *n, uint8_t idx,
 
     if (new_state == NODE_STATE_ALERT || new_state == NODE_STATE_CRITICAL) {
         n->alert_since_ms = k_uptime_get();
-        if (d) mesh_scheduler_request_priority(d->identity.transport, 10000);
+        // if (d) mesh_scheduler_request_priority(d->identity.transport, 10000);
     }
 
     node_transport_t transport = (d != NULL) ? d->identity.transport : NODE_TRANSPORT_THREAD; // default to Thread if no data
@@ -190,7 +191,7 @@ static node_state_t evaluate_imu(semantic_node_t *n,
         s = NODE_STATE_ALERT;
         /* For motion alerts give Thread priority so the
          * fast-moving IMU node can push its data through */
-        mesh_scheduler_request_priority(SCHED_PRIORITY_THREAD, 5000);
+        // mesh_scheduler_request_priority(SCHED_PRIORITY_THREAD, 5000);
     } else if (above_with_hyst(m2, n->last_mag2,
                                thresh_motion_active, THRESH_MOTION_HYST)) {
         s = NODE_STATE_ACTIVE;
@@ -243,6 +244,7 @@ void semantic_handler_process(const struct node_sensor_data *d){
     n->last_rx_ms = now_ms;
     n->ever_seen  = true;
     n->lost_reported = false;
+    n->transport = d->identity.transport;
 
     // first packet -> enter idle
     if(n->state == NODE_STATE_UNKNOWN || n->state == NODE_STATE_LOST){
@@ -278,7 +280,8 @@ void semantic_handler_tick(void){
             
             if(ble_nus_is_ready()){
                 char alert_msg[48];
-                snprintf(alert_msg, sizeof(alert_msg), "{\"node\":%d,\"state\":\"LOST\"}\n", i);
+                const char *tr_tag = (n->transport == NODE_TRANSPORT_BLE_MESH) ? "B" : "T";
+                snprintf(alert_msg, sizeof(alert_msg), "{\"node\":%d,\"tr\":\"%s\",\"state\":\"LOST\"}\n", i, tr_tag);
                 ble_nus_send(alert_msg);
             }
         }

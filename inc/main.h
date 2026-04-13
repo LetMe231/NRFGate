@@ -27,9 +27,13 @@ void mesh_scheduler_start(void);
 void mesh_scheduler_set_timing(uint32_t thread_ms, uint32_t ble_ms);
 void mesh_scheduler_set_mode(sched_mode_t mode);
 
+// Testing
+void mesh_scheduler_suppress_reports(bool suppress);
+
 extern uint32_t sched_thread_ms;
 extern uint32_t sched_ble_ms;
 extern sched_mode_t sched_mode;
+extern int64_t g_last_mesh_rx_ms;
 /**
  * @brief Request priority radio access for one transport.
  *
@@ -43,4 +47,5 @@ extern sched_mode_t sched_mode;
 void mesh_scheduler_request_priority(sched_priority_t transport,
                                      uint32_t duration_ms);
 
+int mesh_scheduler_wait_thread_window(uint32_t timeout_ms);
 #endif /* MAIN_H */

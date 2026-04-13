@@ -21,6 +21,7 @@
 #include <openthread/dataset.h>
 #include <openthread/ip6.h>
 #include <openthread/thread.h>
+#include <stdint.h>
 
 #include "thread_handler.h"
 #include "main.h"
@@ -33,11 +34,29 @@ LOG_MODULE_REGISTER(thread_handler, LOG_LEVEL_INF);
 #define PRIORITY   10
 #define BUF_SIZE   256
 
+#define COAP_PUT_RETRIES 3
+#define COAP_PUT_RETRY_MS 400
+
 static int sock;
 static bool running;
 
 K_THREAD_STACK_DEFINE(thread_rx_stack, STACK_SIZE);
 static struct k_thread thread_rx_tid;
+
+/* ── CoAP TX Thread — forward declarations (before JSON descr) ───── */
+struct coap_cmd {
+    char    ipv6[40];
+    bool    on;
+    uint8_t seq;
+};
+
+#define COAP_TX_STACK_SIZE 4096
+#define COAP_TX_PRIORITY   7
+
+K_MSGQ_DEFINE(s_coap_cmdq, sizeof(struct coap_cmd), 8, 4);
+K_THREAD_STACK_DEFINE(s_coap_tx_stack, COAP_TX_STACK_SIZE);
+static struct k_thread  s_coap_tx_tid;
+static atomic_t s_cmd_seq = ATOMIC_INIT(0);
 
 /* ── JSON Payload Descriptor ─────────────────────────────────── */
 
@@ -134,23 +153,66 @@ static int sensors_post(struct coap_resource *resource,
 
 
     // Parse JSON payload into sensor struct
-    struct sensor_json s = {0};
+    struct sensor_json s = {
+        .seq        = -1,
+        .ts         = -1,
+        .ax         = INT32_MIN,
+        .ay         = INT32_MIN,
+        .az         = INT32_MIN,
+        .gx         = INT32_MIN,
+        .gy         = INT32_MIN,
+        .gz         = INT32_MIN,
+        .temp       = INT32_MIN,
+        .hum        = INT32_MIN,
+        .tvoc       = INT32_MIN,
+        .eco2       = INT32_MIN,
+        .heart_rate = INT32_MIN,
+        .spo2       = INT32_MIN,
+        .raw_red    = INT32_MIN,
+        .raw_ir     = INT32_MIN,
+        .pm25       = INT32_MIN,
+        .pm10       = INT32_MIN,
+        .sw         = -1,
+        .light      = -1,
+    };
+
     char json_buf[BUF_SIZE];
-    size_t copy_len = MIN(payload_len, sizeof(json_buf) - 1);   
+    size_t copy_len = MIN(payload_len, sizeof(json_buf) - 1);
     memcpy(json_buf, payload, copy_len);
     json_buf[copy_len] = '\0';
-    int32_t present = json_obj_parse(json_buf, copy_len, sensor_descr, ARRAY_SIZE(sensor_descr), &s);
-    if (present < 0) {
-        LOG_WRN("Failed to parse JSON from %s: %d", id.ipv6, present);
-        return -EINVAL;
+
+    int ret = json_obj_parse(json_buf, copy_len,
+                            sensor_descr, ARRAY_SIZE(sensor_descr), &s);
+    if (ret < 0) {
+        LOG_WRN("Failed to parse JSON from %s: %d", id.ipv6, ret);
+        return ret;
     }
-    // Hand off to data handler
+
+    uint32_t present = 0;
+    if (s.seq >= 0)                                              present |= SENSOR_HAS_SEQ;
+    if (s.ts  >= 0)                                              present |= SENSOR_HAS_TS;
+    if (s.ax != INT32_MIN && s.ay != INT32_MIN && s.az != INT32_MIN) present |= SENSOR_HAS_ACCEL;
+    if (s.gx != INT32_MIN && s.gy != INT32_MIN && s.gz != INT32_MIN) present |= SENSOR_HAS_GYRO;
+    if (s.temp       != INT32_MIN) present |= SENSOR_HAS_TEMP;
+    if (s.hum        != INT32_MIN) present |= SENSOR_HAS_HUM;
+    if (s.tvoc       != INT32_MIN) present |= SENSOR_HAS_TVOC;
+    if (s.eco2       != INT32_MIN) present |= SENSOR_HAS_ECO2;
+    if (s.heart_rate != INT32_MIN) present |= SENSOR_HAS_HEART_RATE;
+    if (s.spo2       != INT32_MIN) present |= SENSOR_HAS_SPO2;
+    if (s.raw_red    != INT32_MIN) present |= SENSOR_HAS_RAW_RED;
+    if (s.raw_ir     != INT32_MIN) present |= SENSOR_HAS_RAW_IR;
+    if (s.pm25       != INT32_MIN) present |= SENSOR_HAS_PM25;
+    if (s.pm10       != INT32_MIN) present |= SENSOR_HAS_PM10;
+    if (s.sw    == 0 || s.sw    == 1) present |= SENSOR_HAS_SWITCH;
+    if (s.light == 0 || s.light == 1) present |= SENSOR_HAS_LIGHT;
+    /* NOTE: present is uint32_t — no "< 0" check needed */
+    
     struct node_sensor_data nd = {
         .identity = id,
         .payload = {
-            .present = present,
-            .seq = s.seq,
-            .ts = s.ts,
+            .present    = present,
+            .seq        = s.seq,
+            .ts         = s.ts,
             .ax = s.ax, .ay = s.ay, .az = s.az,
             .gx = s.gx, .gy = s.gy, .gz = s.gz,
             .temp = s.temp, .hum = s.hum,
@@ -159,6 +221,7 @@ static int sensors_post(struct coap_resource *resource,
             .raw_red = s.raw_red, .raw_ir = s.raw_ir,
             .pm25 = s.pm25, .pm10 = s.pm10,
             .switch_state = s.sw,
+            .light_on     = (s.light == 1),
         },
         .rx_uptime_ms = k_uptime_get(),
     };
@@ -166,10 +229,11 @@ static int sensors_post(struct coap_resource *resource,
     data_handler_receive(&nd);
 
     if (present & SENSOR_HAS_LIGHT) {
-        uint8_t idx = nd.node_idx;
+        uint8_t idx = data_handler_get_node_idx_by_ipv6(id.ipv6);
         if (idx < MAX_NODES) {
             node_actuator_state[idx].known    = true;
-            node_actuator_state[idx].light_on = (s.light != 0);
+            node_actuator_state[idx].light_on = (s.light == 1);
+            LOG_DBG("Light cache: node=%d light=%d", idx, s.light);
         } 
     }
     return 0;
@@ -207,11 +271,7 @@ static void coap_rx_thread(void *p1, void *p2, void *p3)
 
     /* Wait for OpenThread interface to come up */
     struct net_if *iface = net_if_get_default();
-
-    if (!iface) {
-        LOG_ERR("No network interface found");
-        return;
-    }
+    if (!iface) { LOG_ERR("No network interface"); return; }
 
     while (!net_if_is_up(iface)) {
         LOG_INF("Waiting for network interface...");
@@ -247,6 +307,81 @@ static void coap_rx_thread(void *p1, void *p2, void *p3)
     }
 }
 
+/* ── CoAP TX Thread ──────────────────────────────────────────── */
+
+/* Forward declaration */
+static bool coap_send_con(const char *ipv6, bool on,
+                          uint16_t msg_id, int ack_timeout_ms);
+
+/* ── TX-Thread ────────────────────────────────────────────────
+ * Holt Commands aus der Queue, wartet auf Thread-Fenster,
+ * sendet CON + wartet auf ACK. Retry auf nächstes Thread-Fenster.
+ */
+static void coap_tx_thread_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    static atomic_t s_msg_id = ATOMIC_INIT(1);
+
+    while (1) {
+        struct coap_cmd cmd;
+        /* Warte auf nächsten Command */
+        k_msgq_get(&s_coap_cmdq, &cmd, K_FOREVER);
+
+        /* Neuere Commands für dasselbe Ziel übernehmen (latest-wins) */
+        // struct coap_cmd newer;
+        // while (k_msgq_peek(&s_coap_cmdq, &newer) == 0
+        //        && strcmp(newer.ipv6, cmd.ipv6) == 0) {
+        //     k_msgq_get(&s_coap_cmdq, &cmd, K_NO_WAIT);
+        // }
+
+        LOG_INF("CoAP TX: [%s] %s (seq=%u)", cmd.ipv6,
+                cmd.on ? "ON" : "OFF", cmd.seq);
+
+        bool success = false;
+
+        for (int attempt = 0; attempt < 2 && !success; attempt++) {
+            if (attempt > 0) {
+                LOG_WRN("CoAP retry %d/3 — warte auf Thread-Fenster", attempt);
+            }
+
+            /* Thread-Priorität anfordern: 1500ms reicht für send+ACK */
+            mesh_scheduler_request_priority(SCHED_PRIORITY_THREAD, 250);
+
+            int wr = mesh_scheduler_wait_thread_window(350);
+            if (wr != 0) {
+                LOG_WRN("Thread-Fenster timeout, retry %d", attempt);
+                continue;
+            }
+
+            /* Kurze Stabilisierungspause nach BLE→Thread-Wechsel */
+            k_msleep(80);
+
+            uint16_t mid = (uint16_t)atomic_inc(&s_msg_id);
+            success = coap_send_con(cmd.ipv6, cmd.on, mid,
+                                    120 /* ms ACK-Timeout */);
+
+            if (!success) {
+                LOG_WRN("Kein ACK für msg_id=%u (attempt %d)", mid, attempt+1);
+                /* Kurz warten bevor nächster Versuch */
+                k_msleep(200);
+            }
+        }
+
+        if (success) {
+            LOG_INF("CoAP PUT /light [%s] %s OK",
+                    cmd.ipv6, cmd.on ? "ON" : "OFF");
+            /* Aktuator-Cache aktualisieren */
+            uint8_t idx = data_handler_get_node_idx_by_ipv6(cmd.ipv6);
+            if (idx < MAX_NODES) {
+                node_actuator_state[idx].known    = true;
+                node_actuator_state[idx].light_on = cmd.on;
+            }
+        } else {
+            LOG_ERR("CoAP PUT /light [%s] FAILED after 2 attempts", cmd.ipv6);
+        }
+    }
+}
 /* ── Public API ──────────────────────────────────────────────── */
 
 int thread_handler_init(void)
@@ -261,15 +396,12 @@ int thread_handler_init(void)
     otInstance *ot = openthread_get_default_instance();
     if (ot) {
         otOperationalDataset dataset = {0};
-
-        dataset.mActiveTimestamp.mSeconds = 1;
+        dataset.mActiveTimestamp.mSeconds             = 1;
         dataset.mComponents.mIsActiveTimestampPresent = true;
-
-        dataset.mChannel = 11;
-        dataset.mComponents.mIsChannelPresent = true;
-
-        dataset.mPanId = 0xABCD;
-        dataset.mComponents.mIsPanIdPresent = true;
+        dataset.mChannel                              = 11;
+        dataset.mComponents.mIsChannelPresent         = true;
+        dataset.mPanId                                = 0xABCD;
+        dataset.mComponents.mIsPanIdPresent           = true;
 
         memcpy(dataset.mNetworkKey.m8,
                (uint8_t[]){0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,
@@ -315,79 +447,112 @@ int thread_handler_init(void)
                     PRIORITY, 0, K_NO_WAIT);
 
     LOG_INF("CoAP RX thread started on port %d", COAP_PORT);
+
+    /* CoAP TX Thread starten */
+    k_thread_create(&s_coap_tx_tid, s_coap_tx_stack, COAP_TX_STACK_SIZE,
+                    coap_tx_thread_fn, NULL, NULL, NULL,
+                    COAP_TX_PRIORITY, 0, K_NO_WAIT);
+    k_thread_name_set(&s_coap_tx_tid, "coap_tx");
+    LOG_INF("CoAP TX thread started (prio=%d)", COAP_TX_PRIORITY);
+
     return 0;
 }
-// Coap put/light
-int thread_handler_coap_put_light(const char *ipv6, bool on)
+
+/* ── Internes Send+ACK ────────────────────────────────────────
+ * CON-Paket senden, Socket offen lassen, auf ACK warten (zsock_poll).
+ * Gibt true zurück wenn ACK innerhalb ack_timeout_ms ankam.
+ */
+static bool coap_send_con(const char *ipv6, bool on,
+                           uint16_t msg_id, int ack_timeout_ms)
 {
-    /* Build CoAP packet */
-    static uint8_t pkt_buf[128];
-    static uint16_t msg_id = 1;
+    uint8_t pkt_buf[128];
     struct coap_packet pkt;
 
     int r = coap_packet_init(&pkt, pkt_buf, sizeof(pkt_buf),
                               COAP_VERSION_1,
-                              COAP_TYPE_NON_CON,
+                              COAP_TYPE_CON,
                               COAP_TOKEN_MAX_LEN,
                               coap_next_token(),
                               COAP_METHOD_PUT,
-                              msg_id++);
-    if (r < 0) {
-        LOG_ERR("coap_packet_init: %d", r);
-        return r;
-    }
+                              msg_id);
+    if (r < 0) { LOG_ERR("pkt_init: %d", r); return false; }
 
-    /* URI path: /light */
     r = coap_packet_append_option(&pkt, COAP_OPTION_URI_PATH,
                                   "light", strlen("light"));
-    if (r < 0) { LOG_ERR("URI path: %d", r); return r; }
+    if (r < 0) { LOG_ERR("URI: %d", r); return false; }
 
-    /* Content-Format: application/json */
     uint8_t fmt = COAP_CONTENT_FORMAT_APP_JSON;
     r = coap_packet_append_option(&pkt, COAP_OPTION_CONTENT_FORMAT,
                                   &fmt, sizeof(fmt));
-    if (r < 0) { LOG_ERR("Content-Format: %d", r); return r; }
+    if (r < 0) { LOG_ERR("fmt: %d", r); return false; }
 
     /* Payload */
     r = coap_packet_append_payload_marker(&pkt);
-    if (r < 0) { LOG_ERR("Payload marker: %d", r); return r; }
+    if (r < 0) { LOG_ERR("marker: %d", r); return false; }
 
     const char *body = on ? "{\"on\":true}" : "{\"on\":false}";
     r = coap_packet_append_payload(&pkt, (uint8_t *)body, strlen(body));
-    if (r < 0) { LOG_ERR("Payload: %d", r); return r; }
+    if (r < 0) { LOG_ERR("payload: %d", r); return false; }
 
     /* Open ephemeral socket */
     int tx_sock = zsock_socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
-    if (tx_sock < 0) {
-        LOG_ERR("TX socket: %d", errno);
-        return -errno;
-    }
+    if (tx_sock < 0) { LOG_ERR("socket: %d", errno); return false; }
 
     /* Destination address */
     struct sockaddr_in6 dst = {
         .sin6_family = AF_INET6,
         .sin6_port   = htons(COAP_PORT),
     };
-    r = net_addr_pton(AF_INET6, ipv6, &dst.sin6_addr);
-    if (r < 0) {
-        LOG_ERR("Invalid IPv6: %s", ipv6);
+    if (net_addr_pton(AF_INET6, ipv6, &dst.sin6_addr) < 0) {
+        LOG_ERR("bad IPv6: %s", ipv6);
         zsock_close(tx_sock);
-        return r;
+        return false;
     }
 
-    /* Send */
-    mesh_scheduler_request_priority(SCHED_PRIORITY_THREAD, 2000);
-    k_msleep(300);  /* warten bis Thread-Fenster aktiv */
+    /* Senden */
     r = zsock_sendto(tx_sock, pkt.data, pkt.offset, 0,
                      (struct sockaddr *)&dst, sizeof(dst));
-    zsock_close(tx_sock);
-
     if (r < 0) {
-        LOG_ERR("sendto %s: %d", ipv6, errno);
-        return -errno;
+        LOG_WRN("sendto failed: %d", errno);
+        zsock_close(tx_sock);
+        return false;
     }
 
-    LOG_INF("CoAP PUT /light → [%s] %s (%d bytes)",
-            ipv6, on ? "ON" : "OFF", r);
+    /* Auf ACK warten */
+    struct zsock_pollfd pfd = { .fd = tx_sock, .events = ZSOCK_POLLIN };
+    int pr = zsock_poll(&pfd, 1, ack_timeout_ms);
+
+    bool acked = false;
+    if (pr > 0 && (pfd.revents & ZSOCK_POLLIN)) {
+        uint8_t ack_buf[32];
+        ssize_t n = zsock_recv(tx_sock, ack_buf, sizeof(ack_buf), 0);
+        if (n > 0) {
+            acked = true;
+            LOG_INF("CoAP ACK received (%d B) for msg_id=%u", (int)n, msg_id);
+        }
+    }
+
+    zsock_close(tx_sock);
+    return acked;
+}
+
+
+/* ── Öffentliche API ──────────────────────────────────────────
+ * Gibt sofort zurück — blockiert den Rule-Engine-Work-Queue nicht.
+ */
+int thread_handler_coap_put_light(const char *ipv6, bool on)
+{
+    struct coap_cmd cmd = {0};
+    strncpy(cmd.ipv6, ipv6, sizeof(cmd.ipv6) - 1);
+    cmd.on  = on;
+    cmd.seq = (uint8_t)atomic_inc(&s_cmd_seq);
+
+    int r = k_msgq_put(&s_coap_cmdq, &cmd, K_NO_WAIT);
+    if (r < 0) {
+        LOG_WRN("CoAP queue full — dropping cmd (queue will drain)");
+        return -ENOSPC;
+    }
+
+    LOG_INF("CoAP cmd queued: [%s] %s", ipv6, on ? "ON" : "OFF");
     return 0;
 }

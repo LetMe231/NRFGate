@@ -5,7 +5,7 @@ project(NRFGateway)
 
 target_sources(app PRIVATE 
     src/main.c
-    src/model_handler.c
+    src/ble_mesh_handler.c
     src/thread_handler.c
     src/ble_nus.c
     src/lora_handler.c

@@ -41,16 +41,47 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 uint32_t sched_thread_ms    = 300;
 uint32_t sched_ble_ms       = 200;
 static int64_t   last_scan_ms      = 0;
+
+
+// duplicate change later
+static const uint8_t net_key[16] = {
+    0xF3, 0x43, 0xBB, 0xCD, 0x11, 0x48, 0x9F, 0x37,
+    0x21, 0xF3, 0x23, 0xAC, 0xD0, 0x72, 0x9E, 0xBA,
+};
+
+// Testing
+int64_t  g_ble_active_ms    = 0;
+int64_t  g_thread_active_ms = 0;
+uint32_t g_ble_switches     = 0;
+uint32_t g_thread_switches  = 0;
+static int64_t s_last_switch_ms = 0;
+static atomic_t s_suppress_sched_report = ATOMIC_INIT(0);
+
 #define PRIORITY_CHECK_MS       50
 #define SCAN_WINDOW_BLE_MS      500
 #define SCAN_WINDOW_THREAD_MS   5000
 #define SCAN_INTERVAL_MS        30000
+#define MESH_RX_EXTEND_MS       400
+
+#define WAKE_AHEAD_MS           300
+#define WAKE_DURATION_MS        200
 
 static void mesh_scheduler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(mesh_work, mesh_scheduler);
 
 static bool mesh_active         = true;
+static K_SEM_DEFINE(s_thread_window_sem, 0, 1); /* given when Thread window opens */
+
+int mesh_scheduler_wait_thread_window(uint32_t timeout_ms)
+{
+    /* Wenn Thread-Fenster schon offen: sofort zurück */
+    if (!mesh_active) return 0;
+    /* Sonst warten bis Scheduler das Fenster öffnet */
+    int r = k_sem_take(&s_thread_window_sem, K_MSEC(timeout_ms));
+    return (r == 0) ? 0 : -EAGAIN;
+}
 static bool scheduler_enabled   = false;
+static bool ble_extended = false;
 sched_mode_t sched_mode = SCHED_MODE_NORMAL;
 
 // Priority scheduling state (protected by atomics)
@@ -61,8 +92,16 @@ static int64_t   priority_until_ms  = 0;
 extern bool ble_nus_is_ready(void);
 extern void ble_nus_send(const char *str);
 
+
+// testing
+void mesh_scheduler_suppress_reports(bool suppress)
+{
+    atomic_set(&s_suppress_sched_report, suppress ? 1 : 0);
+}
+
 static void sched_report_status(const char *mode_str, const char *phase_str)
 {
+    if (atomic_get(&s_suppress_sched_report)) return;
     if (!ble_nus_is_ready()) return;
     char buf[64];
     snprintf(buf, sizeof(buf),
@@ -70,6 +109,7 @@ static void sched_report_status(const char *mode_str, const char *phase_str)
              mode_str, phase_str);
     ble_nus_send(buf);
 }
+
 
 void mesh_scheduler_pause(void)
 {
@@ -142,6 +182,7 @@ static void mesh_scheduler(struct k_work *work)
                 bt_mesh_resume(); mesh_active = true;
             } else if (prio == SCHED_PRIORITY_THREAD && mesh_active) {
                 bt_mesh_suspend(); mesh_active = false;
+                k_sem_give(&s_thread_window_sem);
             }
         k_work_reschedule(&mesh_work, K_MSEC(PRIORITY_CHECK_MS));
         return;
@@ -162,6 +203,7 @@ static void mesh_scheduler(struct k_work *work)
         if (last_scan_ms == 0 || (now_ms - last_scan_ms) >= SCAN_INTERVAL_MS) {
             last_scan_ms = now_ms;
             bt_mesh_suspend(); mesh_active = false;
+            k_sem_give(&s_thread_window_sem);
             sched_report_status("ble_only", "scan_thread");
             k_work_reschedule(&mesh_work, K_MSEC(SCAN_WINDOW_THREAD_MS));
         } else {
@@ -173,7 +215,8 @@ static void mesh_scheduler(struct k_work *work)
 
     /* ── Thread-only mode ───────────────────────────────────────── */
     if (sched_mode == SCHED_MODE_THREAD_ONLY) {
-        if (mesh_active) { bt_mesh_suspend(); mesh_active = false; }
+        if (mesh_active) { bt_mesh_suspend(); mesh_active = false;
+            k_sem_give(&s_thread_window_sem); }
 
         /* Periodic short BLE scan window */
         if (last_scan_ms == 0 || (now_ms - last_scan_ms) >= SCAN_INTERVAL_MS) {
@@ -188,13 +231,94 @@ static void mesh_scheduler(struct k_work *work)
         return;
     }
 
-    /* ── Normal alternating ─────────────────────────────────────── */
+    /* ── Normal alternating — MIT adaptivem BLE-Fenster ────────── */
+    mesh_node_schedule_t schedules[MAX_NODES];
+    int sched_count = data_handler_get_mesh_schedules(
+        schedules, MAX_NODES);
+
+    bool wake_needed = false;
+    int64_t earliest_wake = INT64_MAX;
+
+    for (int i = 0; i < sched_count; i++) {
+        /* Prediction ist nur sinnvoll für seltene Sender.
+        * Wenn ein Node öfter sendet als ein voller Zyklus dauert,
+        * fängt die normale Alternation ihn sowieso auf. */
+        uint32_t cycle_2x = (sched_thread_ms + sched_ble_ms) * 10;
+        if (schedules[i].estimated_period_ms < cycle_2x) {
+            continue;
+        }
+
+        int64_t time_until_next = schedules[i].predicted_next_ms - now_ms;
+
+        if (time_until_next <= WAKE_AHEAD_MS &&
+            time_until_next > -WAKE_DURATION_MS) {
+            wake_needed = true;
+            break;
+        }
+
+        int64_t wake_at = schedules[i].predicted_next_ms - WAKE_AHEAD_MS;
+        if (wake_at < earliest_wake) {
+            earliest_wake = wake_at;
+        }
+    }
+
+    if (wake_needed) {
+        /* BLE-Fenster proaktiv öffnen */
+        if (!mesh_active) {
+            int64_t n = k_uptime_get();
+            g_thread_active_ms += n - s_last_switch_ms;
+            s_last_switch_ms = n;
+            g_ble_switches++;
+            bt_mesh_resume();
+            mesh_active = true;
+            sched_report_status("normal", "ble_scheduled");
+        }
+        k_work_reschedule(&mesh_work, K_MSEC(WAKE_DURATION_MS));
+        return;
+    }
+
+    /* Adaptiver Scheduler (reaktiv, wie bisher) */
+    int64_t ms_since_mesh_rx = now_ms - g_last_mesh_rx_ms;
     if (mesh_active) {
-        bt_mesh_suspend(); mesh_active = false;
+        if (!ble_extended && g_last_mesh_rx_ms > 0 && ms_since_mesh_rx < MESH_RX_EXTEND_MS) {
+            k_work_reschedule(&mesh_work, K_MSEC(sched_ble_ms));
+            ble_extended = true;
+            sched_report_status("normal", "ble_extended");
+            return;
+        }
+        /* Zu Thread wechseln */
+        int64_t n = k_uptime_get();
+        g_ble_active_ms += n - s_last_switch_ms;
+        s_last_switch_ms = n;
+        g_thread_switches++;
+        bt_mesh_suspend();
+        mesh_active = false;
+        k_sem_give(&s_thread_window_sem);
+        ble_extended = false;
+        /* Nächsten Wake-up schedulen falls bekannt */
+        if (earliest_wake < INT64_MAX) {
+            int64_t ms_until_wake = earliest_wake - k_uptime_get();
+            if (ms_until_wake > 0 && ms_until_wake < 600000) {
+                /* Thread-Fenster bis kurz vor nächstem erwarteten TX */
+                int64_t thread_window = MIN(ms_until_wake,
+                                            (int64_t)sched_thread_ms);
+                sched_report_status("normal", "thread");
+                k_work_reschedule(&mesh_work, K_MSEC(thread_window));
+                return;
+            }
+        }
+
         sched_report_status("normal", "thread");
         k_work_reschedule(&mesh_work, K_MSEC(sched_thread_ms));
     } else {
-        bt_mesh_resume(); mesh_active = true;
+        /* Thread → BLE */
+        int64_t n = k_uptime_get();
+        g_thread_active_ms += n - s_last_switch_ms;
+        s_last_switch_ms = n;
+        g_ble_switches++;
+        bt_mesh_resume();
+        mesh_active = true;
+        ble_extended = false;
         sched_report_status("normal", "ble");
         k_work_reschedule(&mesh_work, K_MSEC(sched_ble_ms));
     }
@@ -235,8 +359,9 @@ static void button_handler(uint32_t button_state, uint32_t has_changed)
     /* Button 1: Factory reset */
     if ((has_changed & DK_BTN4_MSK) && (button_state & DK_BTN4_MSK)) {
         LOG_INF("Factory reset triggered");
-        bt_mesh_cdb_clear();
         bt_mesh_reset();
+        bt_mesh_cdb_clear();
+        bt_mesh_cdb_create(net_key);
         if(IS_ENABLED(CONFIG_SETTINGS)) {
             settings_save();
         }
