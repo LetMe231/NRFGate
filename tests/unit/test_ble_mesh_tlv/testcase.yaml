@@ -1,0 +1,4 @@
+tests:
+  unit.ble_mesh_tlv:
+    tags: unit
+    platform_allow: native_sim

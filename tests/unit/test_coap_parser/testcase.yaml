@@ -1,0 +1,4 @@
+tests:
+  unit.coap_parser:
+    tags: unit
+    platform_allow: native_sim

@@ -1,0 +1,4 @@
+tests:
+  unit.semantic_handler:
+    tags: unit
+    platform_allow: native_sim

@@ -1,5 +1,0 @@
-#!/usr/bin/env sh
-# Unix wrapper for graphify.
-# Place this file (or a symlink) somewhere on your PATH,
-# or run it directly: ./tools/graphify <command> [options]
-exec python3 "$(dirname "$0")/graphify.py" "$@"

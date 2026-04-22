@@ -1,0 +1,4 @@
+tests:
+  unit.wire_format:
+    tags: unit
+    platform_allow: native_sim

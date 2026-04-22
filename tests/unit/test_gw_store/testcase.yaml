@@ -1,0 +1,4 @@
+tests:
+  unit.gw_store:
+    tags: unit
+    platform_allow: native_sim

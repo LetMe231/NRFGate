@@ -1,0 +1,4 @@
+tests:
+  unit.rule_engine:
+    tags: unit
+    platform_allow: native_sim
