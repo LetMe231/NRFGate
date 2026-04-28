@@ -13,6 +13,10 @@
 #include "ble_mesh_prov.h"
 #include "rule_engine.h"
 #include "lorawan_adapter.h"
+#include "thread_adapter.h"
+#include "ble_mesh_adapter.h"
+#include "scheduler.h"
+#include "gw_addr.h"
 
 LOG_MODULE_REGISTER(nus_handler, LOG_LEVEL_INF);
 
@@ -24,7 +28,6 @@ LOG_MODULE_REGISTER(nus_handler, LOG_LEVEL_INF);
 
 static struct k_work_delayable s_list_rules_work;
 static int64_t s_last_sent_ms[GW_STORE_MAX_NODES] = {0};
-static gw_sensor_payload_t s_last_sent_sensor[GW_STORE_MAX_NODES];
 static bool s_last_sent_sensor_valid[GW_STORE_MAX_NODES];
 
 /* ── JSON Buffer ──────────────────────────────────────── */
@@ -92,33 +95,7 @@ static bool make_node_key(const gw_node_record_t *rec, char *out, size_t out_siz
     if (!rec || !out || out_size == 0) {
         return false;
     }
-
-    switch (rec->addr.transport) {
-    case GW_TR_BLE_MESH: {
-        int n = snprintk(out, out_size, "B:%u", rec->addr.mesh_addr);
-        return n > 0 && (size_t)n < out_size;
-    }
-
-    case GW_TR_THREAD: {
-        char ipv6_str[GW_IPV6_STR_LEN];
-        struct in6_addr addr;
-        memcpy(addr.s6_addr, rec->addr.ipv6, GW_IPV6_BIN_LEN);
-        net_addr_ntop(AF_INET6, &addr, ipv6_str, sizeof(ipv6_str));
-
-        int n = snprintk(out, out_size, "T:%s", ipv6_str);
-        return n > 0 && (size_t)n < out_size;
-    }
-
-    case GW_TR_LORAWAN: {
-        int n = snprintk(out, out_size, "L:%08X%08X",
-                         rec->addr.dev_eui_hi,
-                         rec->addr.dev_eui_lo);
-        return n > 0 && (size_t)n < out_size;
-    }
-
-    default:
-        return false;
-    }
+    return gw_addr_to_str(&rec->addr, out, out_size) == 0;
 }
 static bool build_node_update_json(const gw_node_record_t *rec,
                                    char *buf, size_t buf_size)
@@ -143,42 +120,16 @@ static bool build_node_update_json(const gw_node_record_t *rec,
         return false;
     }
 
-    switch (rec->addr.transport) {
-    case GW_TR_BLE_MESH:
-        if (!append_json(buf, buf_size, &off,
-                        "\"mesh_addr\":%u,",
-                        rec->addr.mesh_addr)) {
-            LOG_WRN("node_update JSON truncated (BLE Mesh addr)");
-            return false;
-        }
-        break;
-
-    case GW_TR_THREAD: {
-        char ipv6_str[GW_IPV6_STR_LEN];
-        struct in6_addr addr;
-        memcpy(addr.s6_addr, rec->addr.ipv6, GW_IPV6_BIN_LEN);
-        net_addr_ntop(AF_INET6, &addr, ipv6_str, sizeof(ipv6_str));
-
-        if (!append_json(buf, buf_size, &off,
-                        "\"ipv6\":\"%s\",", ipv6_str)) {
-            LOG_WRN("node_update JSON truncated (Thread IPv6)");
-            return false;
-        }
-        break;
+    char ipv6_str[GW_IPV6_STR_LEN];
+    if (gw_addr_to_str(&rec->addr, ipv6_str, sizeof(ipv6_str)) != 0) {
+        return false;
     }
 
-    case GW_TR_LORAWAN:
-        if (!append_json(buf, buf_size, &off,
-                        "\"dev_eui\":\"%08X%08X\",",
-                        rec->addr.dev_eui_hi,
-                        rec->addr.dev_eui_lo)) {
-            LOG_WRN("node_update JSON truncated (LoRaWAN addr)");
-            return false;
-        }
-        break;
-
-    default:
-        break;
+    if (!append_json(buf, buf_size, &off,
+                    "\"ipv6\":\"%s\",",
+                    ipv6_str)) {
+        LOG_WRN("node_update JSON truncated (addr)");
+        return false;
     }
 
     if (rec->stats.has_last_rssi) {
@@ -199,7 +150,7 @@ static bool build_node_update_json(const gw_node_record_t *rec,
         }
     }
 
-    if (rec->has_last_sensor) {
+        if (rec->has_last_sensor) {
         const gw_sensor_payload_t *s = &rec->last_sensor;
 
         if (s->present & GW_HAS_SEQ) {
@@ -313,13 +264,27 @@ static bool build_node_update_json(const gw_node_record_t *rec,
             }
         }
 
-        if (s->present & GW_HAS_LIGHT) {
+        if (rec->has_last_actuator_state) {
+            if (!append_json(buf, buf_size, &off,
+                            "\"light\":%d,",
+                            rec->last_light_on ? 1 : 0)) {
+                LOG_WRN("node_update JSON truncated (light from actuator state)");
+                return false;
+            }
+        } else if (s->present & GW_HAS_LIGHT) {
             if (!append_json(buf, buf_size, &off,
                             "\"light\":%d,",
                             s->light_on ? 1 : 0)) {
-                LOG_WRN("node_update JSON truncated (light)");
+                LOG_WRN("node_update JSON truncated (light from sensor)");
                 return false;
             }
+        }
+    } else if (rec->has_last_actuator_state) {
+        if (!append_json(buf, buf_size, &off,
+                        "\"light\":%d,",
+                        rec->last_light_on ? 1 : 0)) {
+            LOG_WRN("node_update JSON truncated (light only)");
+            return false;
         }
     }
 
@@ -342,7 +307,11 @@ static bool build_node_update_json(const gw_node_record_t *rec,
         LOG_WRN("node_update JSON truncated (finalize)");
         return false;
     }
-
+    LOG_INF("JSON build: has_last_sensor=%d present=0x%08x has_last_act=%d last_light=%d",
+        rec->has_last_sensor,
+        rec->has_last_sensor ? rec->last_sensor.present : 0,
+        rec->has_last_actuator_state,
+        rec->last_light_on);
     return true;
 }
 
@@ -363,16 +332,6 @@ static void send_node_update_latest(const gw_node_record_t *rec)
     ble_nus_publish_latest(node_key, buf);
 }
 
-static void send_node_update_immediate(const gw_node_record_t *rec)
-{
-    char buf[JSON_BUF_SIZE];
-
-    if (!build_node_update_json(rec, buf, sizeof(buf))) {
-        return;
-    }
-
-    ble_nus_send_immediate(buf);
-}
 /* ── State-Only Update ─────────────────────────────────────── */
 
 static void send_state_update(const gw_node_record_t *rec)
@@ -381,42 +340,21 @@ static void send_state_update(const gw_node_record_t *rec)
         return;
     }
 
-    char buf[JSON_BUF_SIZE];
-
-    switch (rec->addr.transport) {
-    case GW_TR_BLE_MESH:
-        snprintf(buf, sizeof(buf),
-                 "{\"type\":\"state_update\",\"tr\":\"B\","
-                 "\"mesh_addr\":%u,\"state\":\"%s\"}\n",
-                 rec->addr.mesh_addr,
-                 state_str(rec->state));
-        break;
-    case GW_TR_THREAD: {
-        char ipv6_str[GW_IPV6_STR_LEN];
-        struct in6_addr addr;
-        memcpy(addr.s6_addr, rec->addr.ipv6, GW_IPV6_BIN_LEN);
-        net_addr_ntop(AF_INET6, &addr, ipv6_str, sizeof(ipv6_str));
-
-        snprintf(buf, sizeof(buf),
-                "{\"type\":\"state_update\",\"tr\":\"T\","
-                "\"ipv6\":\"%s\",\"state\":\"%s\"}\n",
-                ipv6_str,
-                state_str(rec->state));
-        break;
-    }
-    case GW_TR_LORAWAN:
-        snprintf(buf, sizeof(buf),
-                 "{\"type\":\"state_update\",\"tr\":\"L\","
-                 "\"dev_eui\":\"%08X%08X\",\"state\":\"%s\"}\n",
-                 rec->addr.dev_eui_hi,
-                 rec->addr.dev_eui_lo,
-                 state_str(rec->state));
-        break;
-    default:
+    char ipv6_str[GW_IPV6_STR_LEN];
+    if (gw_addr_to_str(&rec->addr, ipv6_str, sizeof(ipv6_str)) != 0) {
+        LOG_WRN("Failed to convert node address to string");
         return;
     }
 
-    ble_nus_send_immediate(buf);
+    char buf[160];
+    snprintf(buf, sizeof(buf),
+            "{\"type\":\"state_update\","
+            "\"ipv6\":\"%s\","
+             "\"state\":\"%s\"}\n\"",
+            ipv6_str,
+            state_str(rec->state));
+
+    ble_nus_send(buf);
 }
 
 /* ── Event Listener ────────────────────────────────────────── */
@@ -440,51 +378,20 @@ static void on_event(const gw_event_t *evt, void *ctx)
     }
 
     switch (evt->type) {
-    case GW_EVT_SENSOR: {
-        int64_t now = k_uptime_get();
-        int64_t since = now - s_last_sent_ms[idx];
-        bool heartbeat = (since >= HEARTBEAT_MS);
-
-        const gw_sensor_payload_t *cur = &evt->data.sensor;
-        bool changed = true;
-
-        if (s_last_sent_sensor_valid[idx]) {
-            const gw_sensor_payload_t *prev = &s_last_sent_sensor[idx];
-            changed =
-                prev->temp_mc       != cur->temp_mc       ||
-                prev->hum_mpermille != cur->hum_mpermille ||
-                prev->eco2_ppm      != cur->eco2_ppm      ||
-                prev->tvoc_ppb      != cur->tvoc_ppb      ||
-                prev->light_on      != cur->light_on      ||
-                prev->switch_state  != cur->switch_state;
-        }
-
-        if (!changed && !heartbeat) {
-            return;
-        }
-
-        s_last_sent_sensor[idx] = *cur;
-        s_last_sent_sensor_valid[idx] = true;
-        s_last_sent_ms[idx] = now;
-
-        send_node_update_latest(&rec);
-        break;
-    }
-
     case GW_EVT_STATE_TRANSITION:
-        if (evt->data.state_transition.to == GW_STATE_ALERT ||
-            evt->data.state_transition.to == GW_STATE_CRITICAL) {
-            send_node_update_immediate(&rec);
-        } else {
-            send_state_update(&rec);
-        }
+        send_state_update(&rec);
         break;
 
-    case GW_EVT_BUTTON:
     case GW_EVT_ACTUATOR_STATE:
+        send_node_update_latest(&rec);
+        break;    
     case GW_EVT_CMD_PENDING:
     case GW_EVT_TIMEOUT:
-        send_node_update_immediate(&rec);
+        send_state_update(&rec);
+        break;
+
+    case GW_EVT_SENSOR:
+        send_node_update_latest(&rec);
         break;
 
     default:
@@ -535,6 +442,166 @@ static bool json_get_int(const char *json, const char *key, int32_t *out)
     p += strlen(search);
     *out = (int32_t)strtol(p, NULL, 10);
     return true;
+}
+
+static const char *skip_ws(const char *p)
+{
+    while (p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) {
+        p++;
+    }
+    return p;
+}
+
+static bool json_get_array_bounds(const char *json, const char *key,
+                                  const char **out_start, const char **out_end)
+{
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+
+    const char *p = strstr(json, search);
+    if (!p) {
+        return false;
+    }
+
+    p += strlen(search);
+    p = skip_ws(p);
+
+    if (*p != '[') {
+        return false;
+    }
+
+    p++; /* nach '[' */
+    const char *end = strchr(p, ']');
+    if (!end) {
+        return false;
+    }
+
+    *out_start = p;
+    *out_end = end;
+    return true;
+}
+
+static const char *json_next_array_string(const char *p, const char *end,
+                                          char *out, size_t out_size)
+{
+    if (!p || !end || p >= end || !out || out_size == 0) {
+        return NULL;
+    }
+
+    while (p < end && *p != '"') {
+        p++;
+    }
+
+    if (p >= end) {
+        return NULL;
+    }
+
+    p++; /* nach erstem '"' */
+
+    const char *q = p;
+    while (q < end && *q != '"') {
+        q++;
+    }
+
+    if (q >= end) {
+        return NULL;
+    }
+
+    size_t len = MIN((size_t)(q - p), out_size - 1);
+    memcpy(out, p, len);
+    out[len] = '\0';
+
+    return q + 1;
+}
+
+static bool parse_node_ref(const char *ref, gw_node_addr_t *out)
+{
+    if (!ref || !out || strlen(ref) < 3 || ref[1] != ':') {
+        return false;
+    }
+
+    memset(out, 0, sizeof(*out));
+
+    if (ref[0] == 'B') {
+        out->transport = GW_TR_BLE_MESH;
+        uint16_t mesh_addr = (uint16_t)strtol(ref + 2, NULL, 10);
+        gw_addr_from_mesh(out, mesh_addr);
+        return true;
+    }
+
+    if (ref[0] == 'T') {
+        struct in6_addr addr6;
+        if (net_addr_pton(AF_INET6, ref + 2, &addr6) < 0) {
+            return false;
+        }
+
+        out->transport = GW_TR_THREAD;
+        memcpy(out->ipv6, addr6.s6_addr, GW_IPV6_BIN_LEN);
+        return true;
+    }
+
+    return false;
+}
+
+/* ── Gateway status envelope ─────────────────────────────────
+ *
+ * The Dashboard's heartbeat sends "list_rules" every ~5 s. We respond
+ * with a combined gw_status envelope that contains:
+ *   - active rules (embedded as compact JSON array)
+ *   - uptime
+ *   - per-transport statistics (last_rx_ms, node count)
+ *   - mesh provisioning state
+ *   - scheduler mode + timing
+ *
+ * Format:
+ *   {
+ *     "type": "gw_status",
+ *     "uptime_ms": 1234567,
+ *     "rules": [...],
+ *     "mesh":   {"provisioned":3,"known":3,"last_rx_ms":1234500,"prov_busy":false},
+ *     "thread": {"known":4,"last_rx_ms":1234555},
+ *     "lora":   {"known":1,"last_rx_ms":0},
+ *     "scheduler": {"mode":0,"ble_ms":200,"thread_ms":300},
+ *     "rule_engine": {"active":2,"max":16}
+ *   }
+ *
+ * The buffer is 1024 B which leaves room for ~16 rules with a few targets each.
+ * ──────────────────────────────────────────────────────────── */
+
+static const char *sched_mode_str(sched_mode_t m)
+{
+    switch (m) {
+    case SCHED_MODE_NORMAL:      return "NORMAL";
+    case SCHED_MODE_BLE_ONLY:    return "BLE_ONLY";
+    case SCHED_MODE_THREAD_ONLY: return "THREAD_ONLY";
+    default:                     return "UNKNOWN";
+    }
+}
+
+static int build_rules_json_into(char *buf, size_t size)
+{
+    /* rule_engine_to_json produces "{\"rules\":[...]}\n" — we want just
+     * the inner array because we embed it in gw_status. Strip the wrapper. */
+    char tmp[640];
+    rule_engine_to_json(tmp, sizeof(tmp));
+
+    const char *start = strchr(tmp, '[');
+    if (!start) {
+        return snprintf(buf, size, "[]");
+    }
+    /* find matching closing bracket — last ']' before the trailing }. */
+    const char *end = strrchr(tmp, ']');
+    if (!end || end <= start) {
+        return snprintf(buf, size, "[]");
+    }
+
+    size_t len = (size_t)(end - start) + 1;
+    if (len >= size) {
+        return snprintf(buf, size, "[]");
+    }
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+    return (int)len;
 }
 
 static void list_rules_work_fn(struct k_work *w)
@@ -625,92 +692,74 @@ void nus_handler_cmd(const char *cmd, size_t len)
 
 /* ── Add Rule ──────────────────────────────────────────────── */
 if (strcmp(cmd_str, "add_rule") == 0) {
-    char src_id[64] = {0};
+    char src_ref[GW_IPV6_STR_LEN + 8] = {0};
     int32_t trig = 0, act = 0;
 
-    if (!json_get_str(cmd, "src_node_id", src_id, sizeof(src_id))) {
-        LOG_WRN("NUS: add_rule missing src_node_id"); return;
-    }
-    if (!json_get_int(cmd, "trig", &trig)) {
-        LOG_WRN("NUS: add_rule missing trig"); return;
-    }
-    if (!json_get_int(cmd, "act", &act)) {
-        LOG_WRN("NUS: add_rule missing act"); return;
+    if (!json_get_str(cmd, "src", src_ref, sizeof(src_ref)) &&
+        !json_get_str(cmd, "src_node_id", src_ref, sizeof(src_ref))) {
+        LOG_WRN("NUS: add_rule missing src");
+        return;
     }
 
-    /* src_node_id parsen: "B:2" oder "T:fdde::1" */
+    if (!json_get_int(cmd, "trig", &trig)) {
+        LOG_WRN("NUS: add_rule missing trig");
+        return;
+    }
+
+    if (!json_get_int(cmd, "act", &act)) {
+        LOG_WRN("NUS: add_rule missing act");
+        return;
+    }
+
     gateway_rule_t rule = {0};
     rule.active  = true;
     rule.trigger = (rule_trigger_t)trig;
     rule.action  = (rule_action_t)act;
 
-    char tr_char = src_id[0];
-    const char *addr_part = src_id + 2;
     gw_node_addr_t src_addr = {0};
-    if (tr_char == 'B') {
-        src_addr.transport = GW_TR_BLE_MESH;
-        src_addr.mesh_addr = (uint16_t)strtol(addr_part, NULL, 10);
-    } else if (tr_char == 'T') {
-        src_addr.transport = GW_TR_THREAD;
-        struct in6_addr src_in6;
-        net_addr_pton(AF_INET6, addr_part, &src_in6);
-        memcpy(src_addr.ipv6, src_in6.s6_addr, GW_IPV6_BIN_LEN);
+    if (!parse_node_ref(src_ref, &src_addr)) {
+        LOG_WRN("NUS: add_rule invalid src ref '%s'", src_ref);
+        return;
     }
+
     int src_idx = gw_store_find_node(&src_addr);
     if (src_idx < 0) {
-        LOG_WRN("NUS: add_rule src node not found"); return;
+        LOG_WRN("NUS: add_rule src node not found: %s", src_ref);
+        return;
     }
+
     rule.src_node_idx = (uint8_t)src_idx;
 
-    /*
-     * Targets parsen — JSON Array: "targets":[{"tr":"B","mesh_addr":3},...]
-     * Wir suchen manuell nach jedem Target-Objekt im String.
-     */
-    const char *targets_start = strstr(cmd, "\"targets\": [");
-    if (!targets_start) {
-        LOG_WRN("NUS: add_rule missing targets array"); return;
+    const char *arr_start = NULL;
+    const char *arr_end   = NULL;
+    if (!json_get_array_bounds(cmd, "targets", &arr_start, &arr_end)) {
+        LOG_WRN("NUS: add_rule missing targets array");
+        return;
     }
-    targets_start += strlen("\"targets\": [");
 
-    const char *p = targets_start;
-    while (*p && *p != ']' && rule.target_count < RULE_MAX_TARGETS) {
-        /* Nächstes Objekt { suchen */
-        p = strchr(p, '{');
-        if (!p || *p == ']') break;
-
-        rule_target_t t = {0};
-        char tr_buf[4] = {0};
-
-        /* "tr" Feld lesen */
-        const char *obj_end = strchr(p, '}');
-        if (!obj_end) break;
-
-        /* Temporären null-terminierten Puffer für dieses Objekt */
-        char obj[128] = {0};
-        size_t obj_len = MIN((size_t)(obj_end - p + 1), sizeof(obj) - 1);
-        memcpy(obj, p, obj_len);
-
-        if (json_get_str(obj, "tr", tr_buf, sizeof(tr_buf))) {
-            if (strcmp(tr_buf, "B") == 0) {
-                int32_t ma = 0;
-                json_get_int(obj, "mesh_addr", &ma);
-                t.is_thread  = false;
-                t.dst.mesh_addr  = (uint16_t)ma;
-            } else if (strcmp(tr_buf, "T") == 0) {
-                char ipv6_str[GW_IPV6_STR_LEN] = {0}; 
-                json_get_str(obj, "ipv6", ipv6_str, sizeof(ipv6_str));
-                t.is_thread = true;
-                struct in6_addr addr;
-                net_addr_pton(AF_INET6, ipv6_str, &addr);
-                memcpy(t.dst.ipv6, addr.s6_addr, GW_IPV6_BIN_LEN);
-            }
-            rule.targets[rule.target_count++] = t;
+    const char *p = arr_start;
+    while (rule.target_count < RULE_MAX_TARGETS) {
+        char dst_ref[GW_IPV6_STR_LEN + 8] = {0};
+        const char *next = json_next_array_string(p, arr_end,
+                                                  dst_ref, sizeof(dst_ref));
+        if (!next) {
+            break;
         }
-        p = obj_end + 1;
+
+        gw_node_addr_t dst_addr = {0};
+        if (!parse_node_ref(dst_ref, &dst_addr)) {
+            LOG_WRN("NUS: invalid target ref '%s'", dst_ref);
+            p = next;
+            continue;
+        }
+
+        rule.targets[rule.target_count++] = dst_addr;
+        p = next;
     }
 
     if (rule.target_count == 0) {
-        LOG_WRN("NUS: add_rule no valid targets"); return;
+        LOG_WRN("NUS: add_rule no valid targets");
+        return;
     }
 
     int idx = rule_engine_add(&rule);
@@ -738,8 +787,7 @@ if (strcmp(cmd_str, "add_rule") == 0) {
             LOG_WRN("NUS: BLE cmd missing mesh_addr");
             return;
         }
-        dst.transport = GW_TR_BLE_MESH;
-        dst.mesh_addr = (uint16_t)mesh_addr;
+        gw_addr_from_mesh(&dst, (uint16_t)mesh_addr);
 
     } else if (strcmp(tr_str_val, "T") == 0) {
         char ipv6_str[GW_IPV6_STR_LEN] = {0};
@@ -747,16 +795,17 @@ if (strcmp(cmd_str, "add_rule") == 0) {
             LOG_WRN("NUS: Thread cmd missing ipv6");
             return;
         }
-        dst.transport = GW_TR_THREAD;
         struct in6_addr dst_in6;
-        net_addr_pton(AF_INET6, ipv6_str, &dst_in6);
-        memcpy(dst.ipv6, dst_in6.s6_addr, GW_IPV6_BIN_LEN);
+        if (net_addr_pton(AF_INET6, ipv6_str, &dst_in6) < 0) {
+            LOG_WRN("NUS: invalid IPv6 address: %s", ipv6_str);
+            return;
+        }
+        gw_addr_from_thread(&dst, &dst_in6);
 
     } else if (strcmp(tr_str_val, "L") == 0) {
         int32_t dev_eui_lo = 0;
         json_get_int(cmd, "dev_eui_lo", &dev_eui_lo);
-        dst.transport   = GW_TR_LORAWAN;
-        dst.dev_eui_lo  = (uint32_t)dev_eui_lo;
+        gw_addr_from_lorawan(&dst, (uint64_t)(uint32_t)dev_eui_lo);
 
     } else {
         LOG_WRN("NUS: unknown transport: %s", tr_str_val);

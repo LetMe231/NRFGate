@@ -110,10 +110,6 @@ int ble_mesh_codec_parse_sensor_status(const uint8_t *data,
     gw_event_t evt = {
         .type  = GW_EVT_SENSOR,
         .rx_ms = k_uptime_get(),
-        .src   = {
-            .transport = GW_TR_BLE_MESH,
-            .mesh_addr = src_addr,
-        },
         .rx_meta = {
             .has_rssi   = true,
             .rssi_dbm   = rssi,
@@ -123,6 +119,8 @@ int ble_mesh_codec_parse_sensor_status(const uint8_t *data,
             .rx_ttl = (hops <= MESH_PUB_TTL) ? (MESH_PUB_TTL - hops) : 0,
         },
     };
+
+    gw_addr_from_mesh(&evt.src, src_addr);
 
     gw_sensor_payload_t *s = &evt.data.sensor;
     const uint8_t *p = data;

@@ -4,6 +4,8 @@
 #include <zephyr/logging/log.h>
 
 #include "gw_store.h"
+#include "gw_addr.h"
+#include "reliability_manager.h"
 
 LOG_MODULE_REGISTER(gw_store, LOG_LEVEL_INF);
 
@@ -28,31 +30,6 @@ void gw_store_init(void)
     LOG_INF("Gateway store initialized (max nodes: %d)", GW_STORE_MAX_NODES);
 }
 
-/* ── Adress comparison ──────────────────────────────────────── */
-
-bool gw_addr_eq(const gw_node_addr_t *a, const gw_node_addr_t *b)
-{
-    if (!a || !b) {
-        return false;
-    }
-    if (a->transport != b->transport) return false;
-
-    switch (a->transport) {
-        case GW_TR_BLE_MESH: {
-            return a->mesh_addr == b->mesh_addr;
-        }
-        case GW_TR_THREAD: {
-            return memcmp(a->ipv6, b->ipv6, GW_IPV6_BIN_LEN) == 0;
-        }
-        case GW_TR_LORAWAN: {
-            return (a->dev_eui_hi == b->dev_eui_hi) &&
-                   (a->dev_eui_lo == b->dev_eui_lo);
-        }
-        default:
-            return false;
-    }
-}
-
 /* ── Node Lookup ──────────────────────────────────────── */
 
 int gw_store_find_node(const gw_node_addr_t *addr)
@@ -75,7 +52,7 @@ static int gw_store_find_node_unlocked(const gw_node_addr_t *addr)
     }
 
     for (uint8_t i = 0; i < node_count; i++) {
-        if (nodes[i].known && gw_addr_eq(&nodes[i].addr, addr)) {
+        if (nodes[i].known && gw_addr_equal(&nodes[i].addr, addr)) {
             return i;
         }
     }
@@ -198,11 +175,20 @@ static int gw_store_apply_event_unlocked(const gw_event_t *evt)
         rec->stats.packet_count++;
         rec->caps.has_light = true;
 
-        rec->has_pending_light_cmd = false;
-        rec->pending_cmd_id = 0;
-        rec->pending_since_ms = 0;
+        bool matched = reliability_manager_match_actuator_state(
+            &evt->src,
+            light_on,
+            evt->data.actuator_state.seq
+        );
 
-        LOG_DBG("Node [%d] Actuator state: light is now %s", idx, light_on ? "ON" : "OFF");
+        if (matched) {
+            rec->has_pending_light_cmd = false;
+            rec->pending_cmd_id = 0;
+            rec->pending_since_ms = 0;
+        }
+
+        LOG_DBG("Node [%d] Actuator state: light is now %s (matched=%d)",
+                idx, light_on ? "ON" : "OFF", matched);
         break;
     }
     case GW_EVT_STATE_TRANSITION:
@@ -351,6 +337,18 @@ uint8_t gw_store_count(void)
 {
     k_mutex_lock(&store_lock, K_FOREVER);
     uint8_t count = node_count;
+    k_mutex_unlock(&store_lock);
+    return count;
+}
+uint8_t gw_store_count_by_transport(gw_transport_t tr)
+{
+    uint8_t count = 0;
+    k_mutex_lock(&store_lock, K_FOREVER);
+    for (uint8_t i = 0; i < node_count; i++) {
+        if (nodes[i].known && nodes[i].addr.transport == tr) {
+            count++;
+        }
+    }
     k_mutex_unlock(&store_lock);
     return count;
 }

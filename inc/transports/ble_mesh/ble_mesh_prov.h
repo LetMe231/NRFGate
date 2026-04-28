@@ -83,4 +83,14 @@ void ble_mesh_set_lost_cb(ble_mesh_prov_node_lost_fn fn);
  */
 bool ble_mesh_prov_is_busy(void);
 
+/**
+ * @brief Count provisioned nodes in the BLE Mesh CDB.
+ *
+ * Includes the gateway itself if self-provisioned. Subtract 1 if you only
+ * want client devices.
+ *
+ * @return Number of nodes in the CDB.
+ */
+uint16_t ble_mesh_prov_provisioned_count(void);
+
 #endif /* BLE_MESH_PROV_H_ */

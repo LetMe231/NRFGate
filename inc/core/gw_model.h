@@ -59,10 +59,7 @@ typedef struct {
 
 typedef struct {
     gw_transport_t transport;
-    uint16_t mesh_addr;              /* valid for BLE Mesh */
-    uint8_t ipv6[GW_IPV6_BIN_LEN];  /* valid for Thread */
-    uint32_t dev_eui_hi;             /* valid for LoRaWAN */
-    uint32_t dev_eui_lo;             /* valid for LoRaWAN */
+    uint8_t ipv6[GW_IPV6_BIN_LEN];
 } gw_node_addr_t;
 
 /* ── Connection Metadata ───────────────────────────────────── */

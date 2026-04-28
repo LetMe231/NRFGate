@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "lora_wire_format.h"
+#include "gw_addr.h"
 
 LOG_MODULE_REGISTER(lora_wire_format, LOG_LEVEL_WRN);
 
@@ -93,8 +94,14 @@ int wire_build(const gw_event_t *evt, uint8_t *buf, size_t size)
     buf[off++] = LORA_PKT_SENSOR;
     buf[off++] = (uint8_t)p->seq;
 
+    uint64_t dev_eui;
+    int err = gw_addr_to_lorawan(&evt->src, &dev_eui);
+    if (err) {
+        LOG_ERR("wire_build: failed to convert node address to dev_eui");
+        return err;
+    }
     /* Node ID from dev_eui_lo. */
-    uint16_t node_id = (uint16_t)(evt->src.dev_eui_lo & 0xFFFF);
+    uint16_t node_id = (uint16_t)(dev_eui & 0xFFFF);
     WRITE_U16(buf, off, node_id);
 
     /* Presence mask. */
@@ -207,9 +214,8 @@ bool wire_parse(const uint8_t *buf, size_t len, gw_event_t *out)
     uint8_t seq = buf[1];
     uint16_t node_id = READ_U16(buf, 2);
 
-    out->src.dev_eui_lo = node_id;
-    out->src.dev_eui_hi = 0;
-
+    /* Build full 64-bit device EUI */
+    gw_addr_from_lorawan(&out->src, (uint64_t)node_id);
     /* ALERT packet. */
     if (pkt_type == LORA_PKT_ALERT) {
         if (len < 6) {

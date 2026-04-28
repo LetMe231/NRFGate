@@ -167,6 +167,7 @@ static void thread_codec_emit_to_adapter(const gw_event_t *evt, void *user);
 
 static int thread_send_cmd(gw_adapter_t *base, const gw_command_t *cmd);
 static int64_t thread_last_rx_ms(gw_adapter_t *base);
+static gw_send_mode_t thread_send_mode(gw_adapter_t *base);
 
 static int sensors_post(struct coap_resource *resource,
                         struct coap_packet *request,
@@ -193,6 +194,7 @@ static int thread_onoff_from_cmd(const gw_command_t *cmd, bool *on);
 static const gw_adapter_api_t s_thread_api = {
     .send_cmd   = thread_send_cmd,
     .last_rx_ms = thread_last_rx_ms,
+    .send_mode  = thread_send_mode,
 };
 
 /* ─────────────────────────────────────────────────────────────
@@ -323,6 +325,22 @@ static int64_t thread_last_rx_ms(gw_adapter_t *base)
 {
     thread_adapter_t *self = CONTAINER_OF(base, thread_adapter_t, base);
     return self->last_rx_ms;
+}
+
+/**
+ * @brief Report the synchronicity of the Thread/CoAP send path.
+ *
+ * @param base Generic gateway adapter base pointer (unused).
+ *
+ * @return GW_SEND_QUEUED — thread_send_cmd() places the request into the
+ *         CoAP TX queue. The actual UDP send and CoAP ACK round-trip happen
+ *         later in the dedicated TX worker thread, so a successful send_cmd()
+ *         return only means "queued", not "delivered".
+ */
+static gw_send_mode_t thread_send_mode(gw_adapter_t *base)
+{
+    ARG_UNUSED(base);
+    return GW_SEND_QUEUED;
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -685,7 +703,7 @@ static void coap_tx_thread_fn(void *p1, void *p2, void *p3)
                 k_msleep(200);
             }
 
-            // scheduler_request_priority(SCHED_PRIORITY_THREAD, 700);
+            scheduler_request_priority(SCHED_PRIORITY_THREAD, 700);
 
             uint16_t mid = (uint16_t)atomic_inc(&self->msg_id);
             success = coap_send_con(self, cmd.ipv6, cmd.on, mid, 500);

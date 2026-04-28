@@ -116,4 +116,19 @@ bool    scheduler_is_ble_active(void);
 int64_t scheduler_ms_since_switch(void);
 
 int scheduler_wait_ble_window(uint32_t timeout_ms);
+
+/* ── Status accessors ──────────────────────────────────────── */
+
+/**
+ * @brief Get the current scheduler mode.
+ * @return Current sched_mode_t value.
+ */
+sched_mode_t scheduler_get_mode(void);
+
+/**
+ * @brief Get the current scheduler timing parameters.
+ * @param out_ble_ms      Output for current BLE slot duration (may be NULL).
+ * @param out_thread_ms   Output for current Thread slot duration (may be NULL).
+ */
+void scheduler_get_timing(uint32_t *out_ble_ms, uint32_t *out_thread_ms);
 bool scheduler_is_paused(void);

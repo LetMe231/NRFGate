@@ -546,3 +546,20 @@ int scheduler_wait_ble_window(uint32_t timeout_ms)
         k_msleep(10);
     }
 }
+
+/* ── Status accessors ──────────────────────────────────────── */
+
+sched_mode_t scheduler_get_mode(void)
+{
+    return s_mode;
+}
+
+void scheduler_get_timing(uint32_t *out_ble_ms, uint32_t *out_thread_ms)
+{
+    if (out_ble_ms) {
+        *out_ble_ms = s_ble_ms;
+    }
+    if (out_thread_ms) {
+        *out_thread_ms = s_thread_ms;
+    }
+}

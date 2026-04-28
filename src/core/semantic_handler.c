@@ -23,6 +23,15 @@ static semantic_thresholds_t s_thresholds = {
     .idle_timeout_ms        = 30000,
 };
 
+typedef struct {
+    bool valid;
+    uint16_t last_seq;
+    int64_t last_ts_ms;
+    bool last_pressed;
+} button_guard_t;
+
+static button_guard_t s_button_guard[GW_STORE_MAX_NODES];
+
 static K_MUTEX_DEFINE(s_threshold_lock);
 
 /* ── Threshold API ─────────────────────────────────────────── */
@@ -85,26 +94,53 @@ static gw_state_t calc_state(const gw_sensor_payload_t *s, const semantic_thresh
     return state;
 }
 
+static bool button_event_is_duplicate(int node_idx, uint16_t seq, bool pressed)
+{
+    button_guard_t *g = &s_button_guard[node_idx];
+    int64_t now = k_uptime_get();
+
+    if (g->valid) {
+        if (g->last_seq == seq) {
+            return true;
+        }
+
+        if (g->last_pressed == pressed && (now - g->last_ts_ms) < 250) {
+            return true;
+        }
+    }
+
+    g->valid = true;
+    g->last_seq = seq;
+    g->last_ts_ms = now;
+    g->last_pressed = pressed;
+    return false;
+}
+
 /* ── Event Listener ─────────────────────────────────────────── */
 
 static void on_event(const gw_event_t *evt, void *ctx)
 {
     ARG_UNUSED(ctx);
     LOG_INF("Received event: type=%d from node=%d", evt->type, gw_store_find_node(&evt->src));
-    // Relay button events to rule engine
-    if (evt->type == GW_EVT_BUTTON) {
-        LOG_INF("Rule engine switch: pressed=%d node=%d",
-            evt->data.button.pressed,
-            gw_store_find_node(&evt->src));
-        rule_engine_on_switch(&evt->src, evt->data.button.pressed);
-        return;
-    }
     
     // Only process sensor events
     if (evt->type != GW_EVT_SENSOR) {
         return;
     }
-
+    /* Switch trigger for rule engine */
+    if (evt->data.sensor.present & GW_HAS_SWITCH) {
+        bool sw_on = evt->data.sensor.switch_state;
+        
+        /* Dedupe: nodes retransmit button events, only fire on rising edge */
+        int node_idx = gw_store_find_node(&evt->src);
+        if (node_idx >= 0 && node_idx < GW_STORE_MAX_NODES) {
+            uint16_t seq = (evt->data.sensor.present & GW_HAS_SEQ)
+                        ? (uint16_t)evt->data.sensor.seq : 0;
+            if (!button_event_is_duplicate(node_idx, seq, sw_on)) {
+                rule_engine_on_switch(&evt->src, sw_on);
+            }
+        }
+    }
     // Thresholds snapshot under lock
     semantic_thresholds_t t;
     k_mutex_lock(&s_threshold_lock, K_FOREVER);

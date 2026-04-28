@@ -130,6 +130,7 @@ static void lorawan_adapter_obj_init(lorawan_adapter_t *self,
 
 static int lora_send_cmd(gw_adapter_t *base, const gw_command_t *cmd);
 static int64_t lora_last_rx_ms(gw_adapter_t *base);
+static gw_send_mode_t lora_send_mode(gw_adapter_t *base);
 
 static void lora_tx_thread_fn(void *p1, void *p2, void *p3);
 static int lora_enqueue_tx(lorawan_adapter_t *self, const uint8_t *buf, uint8_t len);
@@ -142,6 +143,7 @@ static int lora_enqueue_tx(lorawan_adapter_t *self, const uint8_t *buf, uint8_t 
 static const gw_adapter_api_t s_lora_api = {
     .send_cmd   = lora_send_cmd,
     .last_rx_ms = lora_last_rx_ms,
+    .send_mode  = lora_send_mode,
 };
 
 /* ─────────────────────────────────────────────────────────────
@@ -341,6 +343,22 @@ static int64_t lora_last_rx_ms(gw_adapter_t *base)
 {
     lorawan_adapter_t *self = CONTAINER_OF(base, lorawan_adapter_t, base);
     return self->last_rx_ms;
+}
+
+/**
+ * @brief Report the synchronicity of the LoRa send path.
+ *
+ * @param base Generic gateway adapter base pointer (unused).
+ *
+ * @return GW_SEND_QUEUED — lora_send_cmd() enqueues into the LoRa TX queue;
+ *         the actual airtime is determined by the LoRa TX worker and the
+ *         radio's duty-cycle / scheduling constraints. A successful
+ *         send_cmd() return only means "queued".
+ */
+static gw_send_mode_t lora_send_mode(gw_adapter_t *base)
+{
+    ARG_UNUSED(base);
+    return GW_SEND_QUEUED;
 }
 
 /* ─────────────────────────────────────────────────────────────

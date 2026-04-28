@@ -25,6 +25,7 @@
 #include "event_ingest.h"
 #include "ble_mesh_codec.h"
 #include "scheduler.h"
+#include "gw_addr.h"
 
 LOG_MODULE_REGISTER(ble_mesh_adapter, LOG_LEVEL_INF);
 
@@ -101,8 +102,6 @@ static void ble_mesh_onoff_status_cb(struct bt_mesh_onoff_cli *cli,
  * ───────────────────────────────────────────────────────────── */
 
 /** @brief Single static BLE Mesh adapter instance. */
-static ble_mesh_adapter_t s_ble;
-
 static ble_mesh_adapter_t s_ble = {
     .onoff_cli = BT_MESH_ONOFF_CLI_INIT(&ble_mesh_onoff_status_cb),
 };
@@ -122,6 +121,7 @@ static void ble_mesh_codec_emit_to_adapter(const gw_event_t *evt, void *user);
 
 static int ble_mesh_send_cmd(gw_adapter_t *base, const gw_command_t *cmd);
 static int64_t ble_mesh_last_rx_ms(gw_adapter_t *base);
+static gw_send_mode_t ble_mesh_send_mode(gw_adapter_t *base);
 
 static ble_mesh_adapter_t *ble_mesh_model_adapter(const struct bt_mesh_model *model);
 static uint8_t ble_mesh_rx_hops(const struct bt_mesh_msg_ctx *ctx);
@@ -142,6 +142,7 @@ static struct bt_mesh_msg_ctx ble_mesh_msg_ctx_for_dst(uint16_t dst);
 static const gw_adapter_api_t s_ble_mesh_api = {
     .send_cmd   = ble_mesh_send_cmd,
     .last_rx_ms = ble_mesh_last_rx_ms,
+    .send_mode  = ble_mesh_send_mode,
 };
 
 /* ─────────────────────────────────────────────────────────────
@@ -208,6 +209,21 @@ static int64_t ble_mesh_last_rx_ms(gw_adapter_t *base)
 {
     ble_mesh_adapter_t *self = CONTAINER_OF(base, ble_mesh_adapter_t, base);
     return self->last_rx_ms;
+}
+
+/**
+ * @brief Report the synchronicity of the BLE Mesh send path.
+ *
+ * @param base Generic gateway adapter base pointer (unused).
+ *
+ * @return GW_SEND_SYNC — bt_mesh_onoff_cli_set() blocks until the message is
+ *         published, so a successful send_cmd() return implies that the
+ *         message is on the air (not queued).
+ */
+static gw_send_mode_t ble_mesh_send_mode(gw_adapter_t *base)
+{
+    ARG_UNUSED(base);
+    return GW_SEND_SYNC;
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -365,7 +381,7 @@ static int ble_mesh_sensor_status_handler(const struct bt_mesh_model *model,
     LOG_INF("Received Sensor Status from 0x%04X [%u bytes] (RSSI %d dBm, hops %u)",
             ctx->addr, buf->len, ctx->recv_rssi, hops);
 
-    // scheduler_request_priority(SCHED_PRIORITY_BLE, 150);
+    scheduler_request_priority(SCHED_PRIORITY_BLE, 150);
 
     int err = ble_mesh_codec_parse_sensor_status(buf->data,
                                                  buf->len,
@@ -396,15 +412,14 @@ static void ble_mesh_onoff_status_cb(struct bt_mesh_onoff_cli *cli,
     gw_event_t evt = {
         .type  = GW_EVT_ACTUATOR_STATE,
         .rx_ms = self->last_rx_ms,
-        .src   = {
-            .transport = GW_TR_BLE_MESH,
-            .mesh_addr = ctx->addr,
-        },
         .rx_meta = ble_mesh_rx_meta(ctx),
         .data.actuator_state = {
+            .seq = -1,
             .light_on = (status->present_on_off != 0),
         },
     };
+
+    gw_addr_from_mesh(&evt.src, ctx->addr);
 
     LOG_INF("OnOff Status from 0x%04X: %s rssi=%d hops=%u",
             ctx->addr,
@@ -539,13 +554,16 @@ static int ble_mesh_send_cmd(gw_adapter_t *base, const gw_command_t *cmd)
         return -EINVAL;
     }
 
-    if (cmd->dst.transport != GW_TR_BLE_MESH) {
-        return -EINVAL;
-    }
-
     uint8_t onoff;
     int err = ble_mesh_onoff_from_cmd(cmd, &onoff);
     if (err) {
+        return err;
+    }
+
+    uint16_t mesh_dst;
+    err = gw_addr_to_mesh(&cmd->dst, &mesh_dst);
+    if (err) {
+        LOG_ERR("Failed to convert destination address to mesh format");
         return err;
     }
 
@@ -555,8 +573,7 @@ static int ble_mesh_send_cmd(gw_adapter_t *base, const gw_command_t *cmd)
         return err;
     }
 
-    struct bt_mesh_msg_ctx ctx = ble_mesh_msg_ctx_for_dst(cmd->dst.mesh_addr);
-
+    struct bt_mesh_msg_ctx ctx = ble_mesh_msg_ctx_for_dst(mesh_dst);
     struct bt_mesh_onoff_set set = {
         .on_off      = (onoff != 0),
         .transition  = NULL,      /* instant */
@@ -568,7 +585,7 @@ static int ble_mesh_send_cmd(gw_adapter_t *base, const gw_command_t *cmd)
     k_mutex_unlock(&self->tx_lock);
 
     if (err) {
-        LOG_WRN("OnOff Set to 0x%04X failed: %d", cmd->dst.mesh_addr, err);
+        LOG_WRN("OnOff Set to 0x%04X failed: %d", mesh_dst, err);
     }
     return err;
 }

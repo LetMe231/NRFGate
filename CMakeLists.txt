@@ -14,6 +14,7 @@ target_sources(app PRIVATE
     src/core/nus_handler.c
     src/core/transport_port.c
     src/core/scheduler.c
+    src/core/gw_addr.c
     src/transports/ble_mesh/ble_mesh_adapter.c
     src/transports/ble_mesh/ble_mesh_prov.c
     src/transports/ble_mesh/ble_mesh_codec.c

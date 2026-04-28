@@ -38,6 +38,7 @@
 #include "nus_handler.h"
 #include "scheduler.h"
 #include "rule_engine.h"
+#include "gw_addr.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -68,11 +69,9 @@ static void button_handler(uint32_t button_state, uint32_t has_changed)
 
 static bool node_is_lost(uint16_t mesh_addr)
 {
-    gw_node_addr_t addr = {
-        .transport = GW_TR_BLE_MESH,
-        .mesh_addr = mesh_addr,
-    };
-
+    gw_node_addr_t addr;
+    gw_addr_from_mesh(&addr, mesh_addr);
+    
     int idx = gw_store_find_node(&addr);
     if (idx < 0) {
         return false;
@@ -167,12 +166,12 @@ int main(void)
     // 8. NUS Handler + Advertising
     nus_handler_init();
 
-    // thread_adapter_setup();
-    // err = thread_adapter_start();
-    // if (err) {
-    //     LOG_ERR("Thread adapter init failed: %d", err);
-    //     return err;
-    // }
+    thread_adapter_setup();
+    err = thread_adapter_start();
+    if (err) {
+        LOG_ERR("Thread adapter init failed: %d", err);
+        return err;
+    }
 
     err = ble_nus_advertise();
     if (err) {
@@ -181,21 +180,40 @@ int main(void)
     }
     // 9. Thread/CoAP
 
-    // // 10. LoRaWAN
-    // lorawan_adapter_setup();
-    // err = lorawan_adapter_start();
-    // if (err) {
-    //     LOG_ERR("LoRaWAN adapter init failed: %d", err);
-    //     return err;
-    // }
+    // 10. LoRaWAN
+    lorawan_adapter_setup();
+    err = lorawan_adapter_start();
+    if (err) {
+        LOG_ERR("LoRaWAN adapter init failed: %d", err);
+        return err;
+    }
 
     // 11. Start semantic tick
     k_work_schedule(&s_semantic_tick_work, K_MSEC(SEMANTIC_TICK_MS));
     rule_engine_init();
 
+
+    gw_node_addr_t mesh_test;
+    gw_addr_from_mesh(&mesh_test, 0x0042);
+    LOG_INF("route(mesh) = %d (expected %d)", gw_addr_route(&mesh_test), GW_TR_BLE_MESH);
+
+    gw_node_addr_t lora_test;
+    gw_addr_from_lorawan(&lora_test, 0xAABB000000000001ULL);
+    LOG_INF("route(lora) = %d (expected %d)", gw_addr_route(&lora_test), GW_TR_LORAWAN);
+
+    /* Fake-Thread: andere fd-Adresse */
+    gw_node_addr_t fake_thread = {0};
+    fake_thread.ipv6[0] = 0xfd;
+    fake_thread.ipv6[1] = 0xab;  /* nicht deine GID */
+    LOG_INF("route(fake_thread) = %d (expected %d)", gw_addr_route(&fake_thread), GW_TR_THREAD);
+
+    /* Junk: nicht-fd */
+    gw_node_addr_t junk = {0};
+    junk.ipv6[0] = 0x20;
+    LOG_INF("route(junk) = %d (expected %d)", gw_addr_route(&junk), GW_TR_UNKNOWN);
     LOG_INF("=== Gateway Initialization Complete ===");
 
-    //scheduler_start();
+    scheduler_start();
 
     while (1) {
         k_sleep(K_SECONDS(10));

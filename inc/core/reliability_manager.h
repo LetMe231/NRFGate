@@ -33,6 +33,16 @@ int reliability_manager_track(const gw_command_t *cmd, uint32_t timeout_ms);
 int reliability_manager_ack(uint32_t cmd_id, int32_t seq);
 
 /**
+ * @brief Match a tracked command against an actuator state update.
+ *
+ * @param src   Source node reference
+ * @param light_on New light state
+ * @param seq     Sequence number from the update
+ * @return 0 on success, -ENOENT if no matching command found
+ */
+int reliability_manager_match_actuator_state(const gw_node_addr_t *src, bool light_on, int32_t seq);
+
+/**
  * @brief Maximum number of simultaneously tracked commands.
  */
 #define RELIABILITY_MAX_TRACKED 8

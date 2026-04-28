@@ -411,7 +411,7 @@ static void advance_to_next_pending(void)
         k_mutex_unlock(&s_pending_mutex);
 
         if (!s_prov_scanning) {
-            //scheduler_start();
+            scheduler_start();
         }
     }
 }
@@ -446,7 +446,7 @@ static void abandon_failed_node(uint16_t addr)
     s_prov_scanning = false;
     dk_set_led_off(DK_LED3);
 
-    //scheduler_start();
+    scheduler_start();
     advance_to_next_pending();
 }
 
@@ -467,7 +467,7 @@ static void schedule_node_retry(void)
             s_node_retry_count + 1, delay_ms);
 
     s_node_retry_count++;
-    //scheduler_start();
+    scheduler_start();
     k_work_schedule_for_queue(&s_cfg_wq,
                               &s_node_configure_work,
                               K_MSEC(delay_ms));
@@ -805,7 +805,7 @@ static void prov_timeout_handler(struct k_work *work)
     s_prov_in_progress = false;
     bt_mesh_prov_disable(BT_MESH_PROV_ADV);
     dk_set_led_off(DK_LED3);
-    //scheduler_start();
+    scheduler_start();
 }
 
 /**
@@ -824,7 +824,7 @@ static void prov_start_handler(struct k_work *work)
         LOG_ERR("Failed to enable provisioning: %d", err);
         s_prov_scanning = false;
         dk_set_led_off(DK_LED3);
-        //scheduler_start();
+        scheduler_start();
         return;
     }
 
@@ -893,7 +893,7 @@ static void unprovision_handler(struct k_work *work)
     if (s_prov_scanning) {
         k_work_schedule_for_queue(&s_cfg_wq, &s_prov_start_work, K_MSEC(500));
     } else {
-        //scheduler_start();
+        scheduler_start();
     }
 }
 
@@ -1149,4 +1149,21 @@ void ble_mesh_prov_set_lost_cb(ble_mesh_prov_node_lost_fn fn)
 bool ble_mesh_prov_is_busy(void)
 {
     return s_prov_scanning || s_prov_in_progress || (s_pending_count > 0);
+}
+
+/* ── Status accessors ──────────────────────────────────────── */
+
+static uint8_t cdb_count_cb(struct bt_mesh_cdb_node *node, void *user_data)
+{
+    ARG_UNUSED(node);
+    uint16_t *count = (uint16_t *)user_data;
+    (*count)++;
+    return BT_MESH_CDB_ITER_CONTINUE;
+}
+
+uint16_t ble_mesh_prov_provisioned_count(void)
+{
+    uint16_t count = 0;
+    bt_mesh_cdb_node_foreach(cdb_count_cb, &count);
+    return count;
 }

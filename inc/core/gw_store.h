@@ -89,4 +89,12 @@ void gw_store_foreach_node(void (*cb)(const gw_node_record_t *rec, void *ctx),
  */
 uint8_t gw_store_count(void);
 
+/**
+ * @brief Return the number of known nodes for a specific transport.
+ *
+ * @param tr Transport to filter by.
+ * @return Number of known nodes with that transport.
+ */
+uint8_t gw_store_count_by_transport(gw_transport_t tr);
+
 #endif /* GATEWAY_STORE_H */

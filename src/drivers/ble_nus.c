@@ -49,11 +49,12 @@ static struct k_work_delayable s_dash_flush_work;
 static struct k_mutex s_dash_lock;
 static uint8_t s_dash_rr_next;
 static uint32_t s_dash_stamp;
+
 static const struct bt_le_conn_param s_nus_conn_param = {
-    .interval_min = 24,
-    .interval_max = 40,
+    .interval_min = 24,    // 30 ms
+    .interval_max = 32,    // 40 ms
     .latency = 0,
-    .timeout = 400,
+    .timeout = 400,        // 4s supervision
 };
 
 /* ───────────────────────────────────────────────────────────── */
@@ -208,18 +209,17 @@ static void nus_send_enabled(enum bt_nus_send_status status)
             LOG_INF("NUS notifications enabled by client (ATT MTU=%u, payload=%u)",
                     mtu, (mtu > 3) ? (mtu - 3) : 0);
         } else {
-        LOG_INF("NUS notifications enabled by client");
+            LOG_INF("NUS notifications enabled by client");
         }
 
         dash_schedule_flush(K_NO_WAIT);
-        k_work_schedule(&s_snapshot_work, K_MSEC(200));
-         
+
+        //k_work_schedule(&s_snapshot_work, K_MSEC(300));
     } else {
         att_ready = false;
         LOG_INF("NUS notifications disabled by client");
     }
 }
-
 static void nus_received(struct bt_conn *conn,
                          const uint8_t *data, uint16_t len)
 {
@@ -318,8 +318,8 @@ static void connected(struct bt_conn *conn, uint8_t err)
         s_cmd_len = 0;
         memset(s_cmd_buf, 0, sizeof(s_cmd_buf));
         LOG_INF("NUS client connected");
-        // int perr = bt_conn_le_param_update(conn, &s_nus_conn_param);
-        // LOG_INF("NUS conn param update requested: %d", perr);
+        int perr = bt_conn_le_param_update(conn, &s_nus_conn_param);
+        LOG_INF("NUS conn param update requested: %d", perr);
     }
 }
 
@@ -328,16 +328,16 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
     ARG_UNUSED(conn);
 
     if (current_conn) {
+        k_work_cancel_delayable(&s_snapshot_work);
+        k_work_cancel_delayable(&s_dash_flush_work);
+
         bt_conn_unref(current_conn);
         current_conn = NULL;
         att_ready = false;
         s_cmd_len = 0;
         memset(s_cmd_buf, 0, sizeof(s_cmd_buf));
 
-        LOG_INF("NUS disc (reason 0x%02x, mesh_active=%d, ms_in_state=%lld)",
-        reason,
-        scheduler_is_ble_active(),
-        scheduler_ms_since_switch());
+        LOG_INF("NUS disc (reason 0x%02x)", reason);
 
         nus_handler_on_disconnect();
 
@@ -347,6 +347,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
         }
     }
 }
+
 static bool le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
 {
     ARG_UNUSED(conn);
@@ -355,8 +356,7 @@ static bool le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
             param->interval_min, param->interval_max,
             param->latency, param->timeout);
 
-    /* Nur zum Debuggen: ALLES ablehnen */
-    return false;
+    return true;
 }
 
 static void le_param_updated(struct bt_conn *conn,

@@ -50,19 +50,6 @@ typedef enum {
     RULE_ACT_TOGGLE = 2,  /* Toggle last known state               */
 } rule_action_t;
 
-/**
- * Target descriptor. `is_thread` selects which half of the union is live:
- *   is_thread == false → dst.mesh_addr
- *   is_thread == true  → dst.ipv6    (binary, 16 bytes)
- */
-typedef struct {
-    bool is_thread;
-    union {
-        uint16_t mesh_addr;
-        uint8_t  ipv6[GW_IPV6_BIN_LEN];
-    } dst;
-} rule_target_t;
-
 /* ── Rule descriptor ─────────────────────────────────────────── */
 typedef struct {
     bool           active;        /* false = slot unused               */
@@ -74,7 +61,7 @@ typedef struct {
     /* Target */
     rule_action_t  action;
     uint8_t        target_count;  /* number of targets in this rule    */
-    rule_target_t  targets[RULE_MAX_TARGETS];
+    gw_node_addr_t targets[RULE_MAX_TARGETS];
 } gateway_rule_t;
 
 /* ── Public API ──────────────────────────────────────────────── */
@@ -113,5 +100,11 @@ bool rule_engine_get(uint8_t idx, gateway_rule_t *out);
  * Writes into buf, returns bytes written.
  */
 int rule_engine_to_json(char *buf, size_t size);
+
+/**
+ * @brief Count the number of currently active rules.
+ * @return Active rule count, range [0, RULE_MAX].
+ */
+uint8_t rule_engine_active_count(void);
 
 #endif /* RULE_ENGINE_H */

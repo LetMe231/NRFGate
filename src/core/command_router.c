@@ -132,60 +132,6 @@ static gw_cmd_type_t resolve_toggle(const gw_node_addr_t *dst)
     return rec.last_light_on ? GW_CMD_LIGHT_OFF : GW_CMD_LIGHT_ON;
 }
 
-/* ─────────────────────────────────────────────────────────────
- * Optimistic local state updates
- * ───────────────────────────────────────────────────────────── */
-
-/**
- * @brief Check whether a command may emit an optimistic local actuator update.
- *
- * Optimistic updates are only safe for transports whose send path is
- * synchronous enough that a successful return means the command was
- * actually handed to the transport immediately.
- *
- * Thread is excluded here because thread_send_cmd() currently only queues
- * into the CoAP TX queue; actual send + ACK happens later in the TX thread.
- * Emitting an actuator-state event at queue time would desynchronize the
- * store from the real device state on failed delivery.
- *
- * @param cmd Command to inspect.
- *
- * @return true if an optimistic state update is allowed, false otherwise.
- */
-static bool command_should_emit_optimistic_state(const gw_command_t *cmd)
-{
-    if (!cmd) {
-        return false;
-    }
-
-    if (cmd->type != GW_CMD_LIGHT_ON && cmd->type != GW_CMD_LIGHT_OFF) {
-        return false;
-    }
-
-    return cmd->dst.transport == GW_TR_BLE_MESH;
-}
-
-/**
- * @brief Emit an optimistic actuator-state event for a successfully sent command.
- *
- * @param cmd Command that completed successfully on a transport that supports
- *            optimistic state updates.
- */
-static void command_emit_optimistic_state(const gw_command_t *cmd)
-{
-    if (!command_should_emit_optimistic_state(cmd)) {
-        return;
-    }
-
-    gw_event_t evt = {
-        .type  = GW_EVT_ACTUATOR_STATE,
-        .rx_ms = k_uptime_get(),
-        .src   = cmd->dst,
-        .data.actuator_state.light_on = (cmd->type == GW_CMD_LIGHT_ON),
-    };
-
-    event_ingest_submit(&evt);
-}
 
 static bool command_is_pending_light_cmd(const gw_command_t *cmd)
 {
@@ -242,13 +188,13 @@ static int command_send_via_adapter(gw_adapter_t *adapter,
     }
 
     if (cmd->dst.transport == GW_TR_BLE_MESH) {
-        //scheduler_request_priority(SCHED_PRIORITY_BLE, CMD_BLE_PRIORITY_MS);
+        scheduler_request_priority(SCHED_PRIORITY_BLE, CMD_BLE_PRIORITY_MS);
 
-        // int wait_err = scheduler_wait_ble_window(600);
-        // if (wait_err) {
-        //     LOG_WRN("BLE window not available for cmd_id=%u", cmd->cmd_id);
-        //     return wait_err;
-        // }
+        int wait_err = scheduler_wait_ble_window(600);
+        if (wait_err) {
+            LOG_WRN("BLE window not available for cmd_id=%u", cmd->cmd_id);
+            return wait_err;
+        }
     }
 
     int err = gw_adapter_send_cmd(adapter, cmd);

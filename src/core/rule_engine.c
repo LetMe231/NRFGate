@@ -27,6 +27,7 @@
 
 #include "gw_model.h"
 #include "gw_store.h"
+#include "gw_addr.h"
 #include "command_router.h"
 #include "rule_engine.h"
 #include "scheduler.h"
@@ -45,7 +46,7 @@ static K_MUTEX_DEFINE(s_mutex);
  * Prevents a single button press from triggering multiple fires
  * when the node sends several retransmissions of the same event.
  */
-#define RULE_COOLDOWN_MS 1200
+#define RULE_COOLDOWN_MS 100
 static int64_t s_last_fire_ms[RULE_MAX];
 
 /* Fire thread stack — calls into mesh transport / CoAP TX which eat
@@ -62,13 +63,21 @@ static struct k_thread s_rule_fire_thread;
 /* Queue stores only the rule slot index (1 B per slot, 8 slots deep). */
 K_MSGQ_DEFINE(s_rule_fire_q, sizeof(uint8_t), 8, 1);
 
+/* ── Fire helper ─────────────────────────────────────── */
 
-/* 16-Byte Binary → IPv6 String */
-static void ipv6_bin_to_str(const uint8_t *bin, char *out, size_t len)
+static void fire_target(const gw_node_addr_t *t, int slot,
+                        gw_cmd_type_t cmd_type, const char *transport_label)
 {
-    struct in6_addr addr;
-    memcpy(addr.s6_addr, bin, GW_IPV6_BIN_LEN);
-    net_addr_ntop(AF_INET6, &addr, out, len);
+    gw_node_addr_t dst = *t;
+    char addr_str[GW_IPV6_STR_LEN];
+    gw_addr_to_str(t, addr_str, sizeof(addr_str));
+
+    LOG_INF("Rule[%d] fire → %s %s %s",
+            slot, transport_label, addr_str,
+            cmd_type == GW_CMD_LIGHT_ON  ? "ON"  :
+            cmd_type == GW_CMD_LIGHT_OFF ? "OFF" : "TOGGLE");
+
+    command_router_send_to(&dst, cmd_type);
 }
 
 /* ── Fire ──────────────────────────────────────────────────── */
@@ -100,7 +109,7 @@ static void fire(const gateway_rule_t *r, int slot)
     /* Count BLE targets so we can request enough priority time. */
     int ble_count = 0;
     for (int i = 0; i < r->target_count; i++) {
-        if (!r->targets[i].is_thread) ble_count++;
+        if (r->targets[i].transport == GW_TR_BLE_MESH) ble_count++;
     }
 
     /*
@@ -109,26 +118,18 @@ static void fire(const gateway_rule_t *r, int slot)
      * Then wait 80 ms for the scheduler to actually switch to BLE before
      * the first bt_mesh_model_send() call.
      */
-    // if (ble_count > 0) {
-    //     scheduler_request_priority(SCHED_PRIORITY_BLE,
-    //                                (uint32_t)ble_count * 400 + 300);
-    //     k_msleep(80);
-    // }
+    if (ble_count > 0) {
+        scheduler_request_priority(SCHED_PRIORITY_BLE,
+                                   (uint32_t)ble_count * 400 + 300);
+        k_msleep(80);
+    }
 
     /* Pass 1: BLE Mesh targets. */
     for (int i = 0; i < r->target_count; i++) {
-        const rule_target_t *t = &r->targets[i];
-        if (t->is_thread) continue;
+        const gw_node_addr_t *t = &r->targets[i];
+        if (t->transport == GW_TR_THREAD) continue;
 
-        gw_node_addr_t dst = {
-            .transport = GW_TR_BLE_MESH,
-            .mesh_addr = t->dst.mesh_addr,
-        };
-        LOG_INF("Rule[%d] fire → BLE 0x%04X %s",
-                slot, t->dst.mesh_addr,
-                cmd_type == GW_CMD_LIGHT_ON  ? "ON"     :
-                cmd_type == GW_CMD_LIGHT_OFF  ? "OFF"    : "TOGGLE");
-        command_router_send_to(&dst, cmd_type);
+        fire_target(t, slot, cmd_type, "BLE Mesh");
 
         k_msleep(50); 
     }
@@ -140,21 +141,10 @@ static void fire(const gateway_rule_t *r, int slot)
     
     /* Pass 2: Thread targets. */
     for (int i = 0; i < r->target_count; i++) {
-        const rule_target_t *t = &r->targets[i];
-        if (!t->is_thread) continue;
+        const gw_node_addr_t *t = &r->targets[i];
+        if (t->transport != GW_TR_THREAD) continue;
 
-        gw_node_addr_t dst = {
-            .transport = GW_TR_THREAD,
-        };
-        memcpy(dst.ipv6, t->dst.ipv6, GW_IPV6_BIN_LEN);
-
-        char ipv6_str[GW_IPV6_STR_LEN] = {0};
-        ipv6_bin_to_str(t->dst.ipv6, ipv6_str, sizeof(ipv6_str));
-        LOG_INF("Rule[%d] fire → Thread %s %s",
-                slot, ipv6_str,
-                cmd_type == GW_CMD_LIGHT_ON  ? "ON"     :
-                cmd_type == GW_CMD_LIGHT_OFF  ? "OFF"    : "TOGGLE");
-        command_router_send_to(&dst, cmd_type);
+        fire_target(t, slot, cmd_type, "Thread");
     }
 }
 
@@ -399,11 +389,10 @@ bool rule_engine_get(uint8_t idx, gateway_rule_t *out)
  *   [idx, src_node_idx, trigger, action, [[type,addr], ...]]
  *
  * Target format:
- *   [0, mesh_addr]       — BLE Mesh
- *   [1, "ipv6"]         — Thread
+ *   [transport, mesh_addr]       — transport: 1=BLE Mesh, 2=Thread, 3=LoRaWAN
  *
  * Example:
- *   {"rules":[[0,1,5,2,[[0,3],[1,"fdde::1"]]]]}
+ *   {"rules":[[0,1,5,2,[[2,fdb1:e25f:ebc5:1000::3],[2,"fdde::1"]]]]}
  */
 int rule_engine_to_json(char *buf, size_t size)
 {
@@ -461,7 +450,7 @@ int rule_engine_to_json(char *buf, size_t size)
 
         bool first_tgt = true;
         for (int j = 0; j < r->target_count; j++) {
-            const rule_target_t *t = &r->targets[j];
+            const gw_node_addr_t *t = &r->targets[j];
 
             if ((size_t)off >= size - 8) {
                 break;
@@ -472,14 +461,10 @@ int rule_engine_to_json(char *buf, size_t size)
             }
             first_tgt = false;
 
-            if (t->is_thread) {
-                char ipv6_str[GW_IPV6_STR_LEN] = {0};
-                ipv6_bin_to_str(t->dst.ipv6, ipv6_str, sizeof(ipv6_str));
-
-                n = snprintf(buf + off, size - off, "[1,\"%s\"]", ipv6_str);
-            } else {
-                n = snprintf(buf + off, size - off, "[0,%d]", t->dst.mesh_addr);
-            }
+            char ipv6_str[GW_IPV6_STR_LEN];
+            gw_addr_to_str(t, ipv6_str, sizeof(ipv6_str));
+            n = snprintf(buf + off, size - off, "[%d,\"%s\"]",
+                         (int)t->transport, ipv6_str);
 
             if (n < 0) {
                 break;
@@ -523,4 +508,15 @@ int rule_engine_to_json(char *buf, size_t size)
     }
 
     return off;
+}
+
+uint8_t rule_engine_active_count(void)
+{
+    uint8_t count = 0;
+    k_mutex_lock(&s_mutex, K_FOREVER);
+    for (int i = 0; i < RULE_MAX; i++) {
+        if (s_rules[i].active) count++;
+    }
+    k_mutex_unlock(&s_mutex);
+    return count;
 }
